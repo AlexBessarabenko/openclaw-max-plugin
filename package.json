@@ -1,5 +1,5 @@
 {
-  "name": "@openclaw/max",
+  "name": "alexbessarabenko-openclaw-max",
   "version": "0.1.0",
   "description": "MAX messenger channel plugin for OpenClaw",
   "type": "module",
@@ -19,6 +19,12 @@
   "peerDependencies": {
     "openclaw": "^2026.5.28"
   },
+  "files": [
+    "dist/",
+    "openclaw.plugin.json",
+    "README.md",
+    "LICENSE"
+  ],
   "openclaw": {
     "extensions": ["./index.ts"],
     "runtimeExtensions": ["./dist/index.js"],

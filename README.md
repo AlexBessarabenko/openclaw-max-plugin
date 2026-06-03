@@ -21,16 +21,25 @@ Tested with OpenClaw 2026.5.28
 
 ## Installation
 
+### Via npm (Recommended)
+
 ```bash
-# Clone into OpenClaw extensions directory
+openclaw plugins install alexbessarabenko-openclaw-max
+```
+
+### Via GitHub
+
+```bash
+openclaw plugins install github:AlexBessarabenko/openclaw-max-plugin
+```
+
+### Manual (Development)
+
+```bash
 cd ~/.openclaw/extensions
 git clone https://github.com/AlexBessarabenko/openclaw-max-plugin.git max
-
-# Install dependencies
 cd max
 npm install
-
-# Build
 npm run build
 ```
 
