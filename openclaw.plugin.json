@@ -4,6 +4,9 @@
   "channels": ["max"],
   "name": "MAX Messenger",
   "description": "MAX Messenger channel plugin for OpenClaw",
+  "activation": {
+    "onStartup": true
+  },
   "configSchema": {
     "type": "object",
     "additionalProperties": false,

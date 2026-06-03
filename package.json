@@ -1,5 +1,5 @@
 {
-  "name": "alexbessarabenko-openclaw-max",
+  "name": "@alexbessarabenko/openclaw-max",
   "version": "0.1.0",
   "description": "MAX messenger channel plugin for OpenClaw",
   "type": "module",
@@ -30,6 +30,14 @@
     "runtimeExtensions": ["./dist/index.js"],
     "setupEntry": "./setup-entry.ts",
     "runtimeSetupEntry": "./dist/setup-entry.js",
+    "compat": {
+      "pluginApi": ">=2026.5.28",
+      "minGatewayVersion": "2026.5.28"
+    },
+    "build": {
+      "openclawVersion": "2026.5.28",
+      "pluginSdkVersion": "2026.5.28"
+    },
     "channel": {
       "id": "max",
       "label": "MAX Messenger",
