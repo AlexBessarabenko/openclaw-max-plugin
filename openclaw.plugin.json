@@ -1,0 +1,32 @@
+{
+  "id": "max",
+  "kind": "channel",
+  "channels": ["max"],
+  "name": "MAX Messenger",
+  "description": "MAX Messenger channel plugin for OpenClaw",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {}
+  },
+  "channelConfigs": {
+    "max": {
+      "schema": {
+        "type": "object",
+        "properties": {
+          "token": { "type": "string" },
+          "allowFrom": {
+            "type": "array",
+            "items": { "type": "string" }
+          }
+        }
+      },
+      "uiHints": {
+        "token": {
+          "label": "Bot token",
+          "sensitive": true
+        }
+      }
+    }
+  }
+}
