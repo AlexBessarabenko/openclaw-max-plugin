@@ -21,7 +21,13 @@ Tested with OpenClaw 2026.5.28
 
 ## Installation
 
-### Via npm (Recommended)
+### Via ClawHub (Recommended)
+
+```bash
+openclaw plugins install clawhub:@alexbessarabenko/openclaw-max
+```
+
+### Via npm
 
 ```bash
 openclaw plugins install alexbessarabenko-openclaw-max
