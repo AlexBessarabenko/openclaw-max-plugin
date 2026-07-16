@@ -1,23 +1,21 @@
 import { defineChannelPluginEntry } from "openclaw/plugin-sdk/channel-core";
-import { dispatchReplyWithBufferedBlockDispatcher } from "openclaw/plugin-sdk/reply-runtime";
-import { maxPlugin, initializeBot, getBot } from "./channel.js";
+import { createTypingCallbacks } from "openclaw/plugin-sdk/channel-reply-pipeline";
+import { getBot, initializeBot, maxPlugin, DEFAULT_ACCOUNT_ID, MAX_CHANNEL_ID } from "./channel.js";
+import { ensureRussianTrustedCAs } from "./certs.js";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk/channel-core";
 import { unlinkSync } from "fs";
 import { writeFile } from "fs/promises";
 import { tmpdir } from "os";
 import { join } from "path";
 
-function isGroupChat(chatType: string): boolean {
-  return chatType === "chat" || chatType === "group" || chatType === "channel";
-}
-
+/** MAX caps message text at 4000 chars. */
+const MAX_TEXT_LIMIT = 4000;
 // Deduplication: messageId → timestamp (TTL 5 min)
-const seenMessages = new Map<number, number>();
+const seenMessages = new Map<string, number>();
 const DEDUP_TTL_MS = 5 * 60 * 1000;
 
-function isDuplicate(messageId: number): boolean {
+function isDuplicate(messageId: string): boolean {
   const now = Date.now();
-  // Clean expired entries
   for (const [id, ts] of seenMessages.entries()) {
     if (now - ts > DEDUP_TTL_MS) {
       seenMessages.delete(id);
@@ -30,27 +28,33 @@ function isDuplicate(messageId: number): boolean {
   return false;
 }
 
+function chunkText(text: string, limit: number): string[] {
+  const chunks: string[] = [];
+  for (let i = 0; i < text.length; i += limit) {
+    chunks.push(text.slice(i, i + limit));
+  }
+  return chunks.length > 0 ? chunks : [""];
+}
+
 // Groq Whisper transcription
 async function transcribeAudio(url: string, token: string, logger: any): Promise<string | null> {
   const tmpPath = join(tmpdir(), `max-audio-${Date.now()}.ogg`);
   try {
-    // Download file
     const resp = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
     if (!resp.ok) throw new Error(`Download failed: ${resp.status}`);
     const buf = await resp.arrayBuffer();
     await writeFile(tmpPath, Buffer.from(buf));
 
-    // Transcribe via Groq
+    const groqKey = process.env.GROQ_API_KEY;
+    if (!groqKey) {
+      logger.warn("[MAX] GROQ_API_KEY not set, skipping transcription");
+      return null;
+    }
+
     const form = new FormData();
     form.append("file", new Blob([Buffer.from(buf)]), "audio.ogg");
     form.append("model", "whisper-large-v3");
     form.append("language", "ru");
-
-    const groqKey = process.env.GROQ_API_KEY;
-    if (!groqKey) {
-      logger.warn("[MAX Plugin] GROQ_API_KEY not set, skipping transcription");
-      return null;
-    }
 
     const groqResp = await fetch("https://api.groq.com/openai/v1/audio/transcriptions", {
       method: "POST",
@@ -66,202 +70,325 @@ async function transcribeAudio(url: string, token: string, logger: any): Promise
     const groqJson = (await groqResp.json()) as { text?: string };
     return groqJson.text || null;
   } catch (err: any) {
-    logger.error("[MAX Plugin] Audio transcription error: " + err.message);
+    logger.error("[MAX] Audio transcription error: " + err.message);
     return null;
   } finally {
     try { unlinkSync(tmpPath); } catch { /* ignore */ }
   }
 }
 
-// Build inbound context from raw message data
-async function buildInboundContext(params: {
-  api: OpenClawPluginApi;
-  messageId: number;
-  text: string | null;
+type InboundFacts = {
+  messageId: string;
+  text: string;
   senderId: string;
   senderName: string;
+  senderIsBot: boolean;
   chatId: string;
-  chatType: string;
+  isGroup: boolean;
+  timestamp?: number;
   attachments?: any[];
-  token: string;
-}) {
-  const { api, messageId, text, senderId, senderName, chatId, chatType, attachments, token } = params;
-  const bot = getBot();
-  const isGroup = isGroupChat(chatType);
+};
 
-  let finalText = text || "";
+/** Normalize a raw MAX update (webhook or polling) into inbound facts. */
+function extractInboundFacts(update: any): InboundFacts | null {
+  const type = update?.update_type;
 
-  // Process audio attachments (transcription)
-  api.logger?.info(`[MAX] Processing ${attachments?.length || 0} attachments`);
-  
-  if (attachments && attachments.length > 0) {
-    for (const att of attachments) {
-      api.logger?.info(`[MAX] Attachment type=${att.type}, hasUrl=${!!att.payload?.url}, hasToken=${!!att.payload?.token}`);
-      if (att.type === "audio" && att.payload?.url && att.payload?.token) {
-        const transcription = await transcribeAudio(att.payload.url, att.payload.token, api.logger);
-        if (transcription) {
-          finalText = finalText ? `${finalText}\n[Voice]: ${transcription}` : `[Voice]: ${transcription}`;
-        }
+  if (type === "message_created" && update.message) {
+    const m = update.message;
+    const sender = m.sender ?? {};
+    const recipient = m.recipient ?? {};
+    const body = m.body ?? {};
+    const chatId = recipient.chat_id ?? m.chat_id ?? update.chat_id;
+    const senderId = sender.user_id ?? m.sender_id;
+    if (chatId == null || senderId == null) return null;
+    const senderName =
+      sender.name ||
+      [sender.first_name, sender.last_name].filter(Boolean).join(" ") ||
+      "Unknown";
+    return {
+      messageId: String(body.mid ?? m.id ?? `${chatId}:${body.seq ?? m.timestamp ?? Date.now()}`),
+      text: body.text ?? m.text ?? "",
+      senderId: String(senderId),
+      senderName,
+      senderIsBot: Boolean(sender.is_bot),
+      chatId: String(chatId),
+      isGroup: (recipient.chat_type ?? m.chat_type ?? "dialog") !== "dialog",
+      timestamp: m.timestamp,
+      attachments: m.attachments ?? body.attachments ?? undefined,
+    };
+  }
+
+  // "Начать" button pressed in a dialog; payload carries the deep-link parameter
+  if (type === "bot_started") {
+    const user = update.user ?? {};
+    const chatId = update.chat_id ?? user.user_id;
+    if (chatId == null || user.user_id == null) return null;
+    const payload = typeof update.payload === "string" && update.payload ? ` ${update.payload}` : "";
+    return {
+      messageId: `bot_started:${chatId}:${update.timestamp ?? Date.now()}`,
+      text: `/start${payload}`,
+      senderId: String(user.user_id),
+      senderName: user.name || [user.first_name, user.last_name].filter(Boolean).join(" ") || "Unknown",
+      senderIsBot: false,
+      chatId: String(chatId),
+      isGroup: false,
+      timestamp: update.timestamp,
+    };
+  }
+
+  return null;
+}
+
+function attachmentContentType(att: any): string {
+  if (att?.type === "image") return "image/jpeg";
+  if (att?.type === "video") return "video/mp4";
+  if (att?.type === "file") {
+    return att?.payload?.filename?.endsWith(".pdf") ? "application/pdf" : "application/octet-stream";
+  }
+  return "application/octet-stream";
+}
+
+/** Attachment URLs live on MAX infrastructure and accept the bot/file token. */
+function attachmentNeedsAuth(url: string): boolean {
+  try {
+    const host = new URL(url).hostname;
+    return /(^|\.)max\.ru$/.test(host) || /(^|\.)oneme\.ru$/.test(host);
+  } catch {
+    return false;
+  }
+}
+
+async function downloadAttachment(url: string, token?: string): Promise<Buffer> {
+  const headers =
+    token && attachmentNeedsAuth(url) ? { Authorization: `Bearer ${token}` } : undefined;
+  const resp = await fetch(url, headers ? { headers } : undefined);
+  if (!resp.ok) throw new Error(`download failed: HTTP ${resp.status}`);
+  return Buffer.from(await resp.arrayBuffer());
+}
+
+type MediaFact = {
+  path?: string;
+  url?: string;
+  contentType?: string;
+  kind: "image" | "video" | "audio" | "document" | "unknown";
+  transcribed?: boolean;
+};
+
+/** Download attachments into the media store; transcribe voice via Groq. */
+async function buildTextAndMedia(
+  api: OpenClawPluginApi,
+  facts: InboundFacts,
+  token: string,
+): Promise<{ text: string; media: MediaFact[] }> {
+  const rt = (api as any).runtime?.channel;
+  const media: MediaFact[] = [];
+  let text = facts.text;
+
+  for (const att of facts.attachments ?? []) {
+    const url = att?.payload?.url ?? (Array.isArray(att?.payload?.ls) ? att.payload.ls[0] : undefined);
+    if (!url) continue;
+
+    if (att.type === "audio") {
+      const transcription = await transcribeAudio(url, att?.payload?.token ?? token, api.logger);
+      if (transcription) {
+        text = text ? `${text}\n[Voice]: ${transcription}` : `[Voice]: ${transcription}`;
       }
+      continue;
+    }
+
+    const kind: MediaFact["kind"] =
+      att.type === "image" ? "image" : att.type === "video" ? "video" : att.type === "file" ? "document" : "unknown";
+    if (kind === "unknown") continue;
+
+    const contentType = attachmentContentType(att);
+    try {
+      const buf = await downloadAttachment(url, att?.payload?.token ?? token);
+      if (rt?.media?.saveMediaBuffer) {
+        const saved = await rt.media.saveMediaBuffer(buf, contentType, "inbound", undefined, att?.payload?.filename);
+        media.push({ path: saved.path, url: saved.path, contentType: saved.contentType ?? contentType, kind });
+      } else {
+        media.push({ url, contentType, kind });
+      }
+    } catch (err: any) {
+      api.logger.warn(`[MAX] attachment download failed: ${err.message}`);
+      media.push({ url, contentType, kind });
     }
   }
 
-  // Build media context from attachments
-  const mediaInputs: any[] = [];
-  
-  api.logger?.info(`[MAX] Building media context, attachments count=${attachments?.length || 0}`);
-  
-  if (attachments && attachments.length > 0) {
-    for (const att of attachments) {
-      // MAX API has different payload structures:
-      // - image: payload has photo_id, token, and url in 'ls' array (ls[0] = full size)
-      // - file: payload has url directly
-      // - video: payload has url directly
-      let url = att.payload?.url || null;
-      if (!url && att.payload?.ls && Array.isArray(att.payload.ls) && att.payload.ls.length > 0) {
-        url = att.payload.ls[0];
-      }
-      api.logger?.info(`[MAX] Attachment type=${att.type}, url=${url?.substring(0, 80) || 'none'}, ls=${JSON.stringify(att.payload?.ls || []).substring(0, 100)}, payload=${JSON.stringify(att.payload).substring(0, 200)}`);
-      
-      if (att.type === "image" && url) {
-        mediaInputs.push({
-          kind: "image",
-          url: url,
-          contentType: "image/jpeg",
-        });
-      } else if (att.type === "video" && url) {
-        mediaInputs.push({
-          kind: "video",
-          url: url,
-          contentType: "video/mp4",
-        });
-      } else if (att.type === "file" && url) {
-        mediaInputs.push({
-          kind: "document",
-          url: url,
-          contentType: att.payload?.filename?.endsWith('.pdf') ? "application/pdf" : "application/octet-stream",
-        });
-      }
-    }
+  return { text, media };
+}
+
+/** Feed one normalized inbound message into the OpenClaw runtime. */
+async function runInbound(api: OpenClawPluginApi, facts: InboundFacts, token: string): Promise<void> {
+  const rt = (api as any).runtime?.channel;
+  if (!rt?.inbound?.run) {
+    api.logger.warn("[MAX] api.runtime.channel not available, skipping inbound");
+    return;
   }
 
-  // Build media payload for ctxPayload
-  const mediaPayload = mediaInputs.length > 0 ? {
-    MediaUrls: mediaInputs.map(m => m.url),
-    MediaTypes: mediaInputs.map(m => m.contentType),
-    MediaPaths: mediaInputs.map(m => m.url),
-  } : undefined;
-  
-  api.logger?.info(`[MAX] Media payload built: ${mediaInputs.length} items, urls=${JSON.stringify(mediaPayload?.MediaUrls?.map(u => u.substring(0, 80)) || [])}`);
+  const { text, media } = await buildTextAndMedia(api, facts, token);
+  const { chatId, senderId, senderName, isGroup } = facts;
 
   api.logger.info(
-    `[MAX] inbound: chat=${chatId} type=${isGroup ? "group" : "direct"} from=${senderId} preview="${finalText?.substring(0, 50)}"`
+    `[MAX] inbound: chat=${chatId} type=${isGroup ? "group" : "direct"} from=${senderId} preview="${text.substring(0, 50)}"`
   );
 
-  return {
-    channel: "max" as const,
-    accountId: "max-account",
-    raw: {
-      messageId,
-      text: finalText,
-      senderId,
-      senderName,
-      chatId,
-      chatType,
-      attachments,
-    },
+  await rt.inbound.run({
+    channel: MAX_CHANNEL_ID,
+    accountId: DEFAULT_ACCOUNT_ID,
+    raw: facts,
     adapter: {
-      ingest: (raw: any) => ({
+      ingest: (raw: InboundFacts) => ({
         id: raw.messageId,
-        rawText: raw.text,
-        raw: raw,
+        timestamp: raw.timestamp,
+        rawText: text,
+        textForAgent: text,
+        textForCommands: text,
+        raw,
       }),
-      resolveTurn: async (_input: any, _eventClass: any, _preflight: any) => {
+      resolveTurn: async () => {
+        const cfg = (api as any).runtime.config.current();
+
+        // Canonical routing: bindings may map this peer to a specific agent
+        const route = rt.routing.resolveAgentRoute({
+          cfg,
+          channel: MAX_CHANNEL_ID,
+          accountId: DEFAULT_ACCOUNT_ID,
+          peer: { kind: isGroup ? "group" : "direct", id: isGroup ? chatId : senderId },
+        });
+
+        // Default-route DMs get per-peer sessions instead of collapsing into
+        // the agent main session (same override the Telegram channel applies)
+        let sessionKey = route.sessionKey;
+        if (!isGroup && route.matchedBy === "default") {
+          sessionKey = rt.routing.buildAgentSessionKey({
+            agentId: route.agentId,
+            channel: MAX_CHANNEL_ID,
+            accountId: route.accountId,
+            peer: { kind: "direct", id: senderId },
+            dmScope: "per-account-channel-peer",
+            identityLinks: cfg.session?.identityLinks,
+          });
+        }
+
+        const storePath = rt.session.resolveStorePath(cfg.session?.store, { agentId: route.agentId });
+
+        const ctxPayload = rt.inbound.buildContext({
+          channel: MAX_CHANNEL_ID,
+          accountId: route.accountId,
+          provider: "max",
+          surface: "max",
+          messageId: facts.messageId,
+          timestamp: facts.timestamp,
+          from: isGroup ? `max:group:${chatId}` : `max:${senderId}`,
+          sender: { id: senderId, name: senderName, isBot: facts.senderIsBot },
+          conversation: {
+            kind: isGroup ? "group" : "direct",
+            id: chatId,
+            label: isGroup ? `MAX chat ${chatId}` : senderName,
+          },
+          route: {
+            agentId: route.agentId,
+            accountId: route.accountId,
+            routeSessionKey: sessionKey,
+            mainSessionKey: route.mainSessionKey,
+          },
+          reply: { to: `max:${chatId}` },
+          message: {
+            inboundEventKind: "user_request",
+            rawBody: text,
+            body: text,
+            bodyForAgent: text,
+            commandBody: text,
+          },
+          access: { commands: { authorized: false, useAccessGroups: false, allowTextCommands: true } },
+          media: media.length > 0 ? media : undefined,
+        });
+
+        const sendTyping = async () => {
+          const bot = getBot();
+          if (bot) {
+            await bot.api.sendAction(Number(chatId), "typing_on");
+          }
+        };
+
         return {
-          cfg: api.runtime!.config.current() as any,
-          channel: "max" as const,
-          accountId: "max-account",
-          agentId: "default",
-          routeSessionKey: `max:${chatId}`,
-          storePath: `max/${chatId}`,
-          ctxPayload: {
-            Body: finalText,
-            BodyForAgent: finalText,
-            RawBody: finalText,
-            CommandBody: finalText,
-            BodyForCommands: finalText,
-            From: senderId,
-            To: chatId,
-            SessionKey: `max:${chatId}`,
-            MessageSid: String(messageId),
-            InboundEventKind: "user_request" as const,
-            Sender: {
-              id: senderId,
-              name: senderName,
+          channel: MAX_CHANNEL_ID,
+          accountId: route.accountId,
+          routeSessionKey: sessionKey,
+          storePath,
+          ctxPayload,
+          recordInboundSession: rt.session.recordInboundSession,
+          record: {
+            updateLastRoute: {
+              sessionKey,
+              channel: MAX_CHANNEL_ID,
+              to: `max:${chatId}`,
+              accountId: route.accountId,
             },
-            Conversation: {
-              kind: isGroup ? "group" : "direct",
-              id: chatId,
-            },
-            CommandAuthorized: false,
-            ...mediaPayload,
+            onRecordError: (err: unknown) =>
+              api.logger.warn(`[MAX] session record failed: ${(err as Error)?.message ?? err}`),
           },
-          recordInboundSession: async (_session: any) => {
-            // Session recorded
-          },
-          dispatchReplyWithBufferedBlockDispatcher: async (params: any) => {
-            return await dispatchReplyWithBufferedBlockDispatcher({
-              ctx: params.ctx,
-              cfg: params.cfg,
+          runDispatch: () =>
+            rt.reply.dispatchReplyWithBufferedBlockDispatcher({
+              ctx: ctxPayload,
+              cfg,
               dispatcherOptions: {
-                ...params.dispatcherOptions,
-                typingCallbacks: {
-                  onReplyStart: async () => {
-                    if (bot) {
-                      try {
-                        await bot.api.sendAction(Number(chatId), "typing_on");
-                      } catch (e) {
-                        // ignore typing errors
-                      }
-                    }
+                typingCallbacks: createTypingCallbacks({
+                  start: sendTyping,
+                  onStartError: () => {
+                    // typing is best-effort
                   },
-                  onReplyEnd: async () => {
-                    // typing stops automatically
-                  },
-                },
-                deliver: async (payload: any, _info: any) => {
-                  if (bot) {
-                    if (isGroup) {
-                      await bot.api.sendMessageToChat(
-                        Number(chatId),
-                        payload.text,
-                        { format: "markdown" }
-                      );
-                    } else {
-                      await bot.api.sendMessageToUser(
-                        Number(senderId),
-                        payload.text,
-                        { format: "markdown" }
-                      );
+                  keepaliveIntervalMs: 4000,
+                  maxDurationMs: 120000,
+                }),
+                deliver: async (payload: any) => {
+                  const bot = getBot();
+                  const out = typeof payload?.text === "string" ? payload.text : "";
+                  if (!bot || !out.trim()) return undefined;
+                  const messageIds: string[] = [];
+                  for (const chunk of chunkText(out, MAX_TEXT_LIMIT)) {
+                    let sent;
+                    try {
+                      sent = await bot.api.sendMessageToChat(Number(chatId), chunk, { format: "markdown" });
+                    } catch {
+                      // invalid markdown must not lose the reply
+                      sent = await bot.api.sendMessageToChat(Number(chatId), chunk);
                     }
+                    const mid = (sent as any)?.message?.body?.mid ?? (sent as any)?.body?.mid ?? (sent as any)?.id;
+                    if (mid != null) messageIds.push(String(mid));
                   }
+                  return messageIds.length > 0 ? { messageIds } : undefined;
+                },
+                onError: (err: any) => {
+                  api.logger.error(`[MAX] reply dispatch error: ${err?.message ?? err}`);
                 },
               },
-            });
-          },
-          delivery: {
-            deliver: async (_payload: any, _info: any) => {
-              // Fallback delivery
-            },
-          },
+            }),
         };
       },
     },
-  };
+  });
+}
+
+/** Shared update handler for webhook and polling transports. */
+async function handleUpdate(api: OpenClawPluginApi, update: any, token: string): Promise<void> {
+  const facts = extractInboundFacts(update);
+  if (!facts) return;
+
+  // Loop protection: never react to other bots (or our own echo)
+  if (facts.senderIsBot) return;
+
+  if (isDuplicate(facts.messageId)) {
+    api.logger.info(`[MAX] duplicate message ${facts.messageId} ignored`);
+    return;
+  }
+
+  await runInbound(api, facts, token);
 }
 
 export default defineChannelPluginEntry({
-  id: "max",
+  id: MAX_CHANNEL_ID,
   name: "MAX Messenger",
   description: "MAX Messenger channel plugin for OpenClaw",
   plugin: maxPlugin,
@@ -282,23 +409,35 @@ export default defineChannelPluginEntry({
     );
   },
   async registerFull(api: OpenClawPluginApi) {
+    ensureRussianTrustedCAs(api.logger);
+
     const cfg = api.config as any;
-    const token = cfg?.channels?.max?.token as string | undefined;
+    const section = cfg?.channels?.[MAX_CHANNEL_ID];
+    const token = section?.token as string | undefined;
 
     if (!token) {
-      api.logger.warn("[MAX Plugin] No token found, bot not initialized");
+      api.logger.warn("[MAX] No token found, bot not initialized");
       return;
     }
 
-    const bot = initializeBot(token);
-    let webhookActive = false;
+    const bot = initializeBot(token, section?.apiBaseUrl);
+    const baseUrl = section?.apiBaseUrl ?? "https://platform-api2.max.ru";
 
-    // --- Webhook handler (primary) ---
+    // --- Webhook handler ---
     api.registerHttpRoute({
       path: "/max/webhook",
       auth: "plugin",
       handler: async (req, res) => {
         try {
+          if (section?.webhookSecret) {
+            const header = req.headers["x-max-bot-api-secret"];
+            if (header !== section.webhookSecret) {
+              res.statusCode = 403;
+              res.end("forbidden");
+              return true;
+            }
+          }
+
           const body = await new Promise<string>((resolve, reject) => {
             let data = "";
             req.on("data", (chunk) => (data += chunk));
@@ -308,48 +447,16 @@ export default defineChannelPluginEntry({
 
           const update = JSON.parse(body);
 
-          api.logger?.info(`[MAX] Webhook received update_type=${update.update_type}, hasMessage=${!!update.message}, body=${JSON.stringify(update.message?.body || {}).substring(0, 200)}`);
-
-          if (update.update_type === "message_created" && update.message) {
-            const message = update.message;
-            const sender = message.sender || {};
-            const recipient = message.recipient || {};
-            const messageId = message.body?.mid || message.id;
-            const numericMessageId = Number(messageId);
-
-            if (isDuplicate(numericMessageId)) {
-              res.statusCode = 200;
-              res.end("ok");
-              return true;
-            }
-
-            const inbound = await buildInboundContext({
-              api: api!,
-              messageId: numericMessageId,
-              text: message.body?.text || message.text || null,
-              senderId: String(sender.user_id || message.sender_id),
-              senderName: sender.name || sender.first_name || "Unknown",
-              chatId: String(recipient.chat_id || message.chat_id),
-              chatType: recipient.chat_type || "dialog",
-              attachments: (message.attachments?.length > 0 ? message.attachments : null) || message.body?.attachments || undefined,
-              token,
-            });
-
-            if (!api.runtime) {
-              api.logger.warn("[MAX Plugin] api.runtime not available, skipping inbound");
-              res.statusCode = 200;
-              res.end("ok");
-              return true;
-            }
-
-            await api.runtime.channel.inbound.run(inbound);
-          }
-
+          // MAX requires a timely HTTP 200; process after ACK
           res.statusCode = 200;
           res.end("ok");
+
+          handleUpdate(api, update, token).catch((err: any) =>
+            api.logger.error("[MAX] update handling failed: " + (err?.message ?? err))
+          );
           return true;
         } catch (err: any) {
-          api.logger.error("[MAX Plugin] Webhook error: " + err.message);
+          api.logger.error("[MAX] Webhook error: " + err.message);
           res.statusCode = 500;
           res.end("error");
           return true;
@@ -357,52 +464,51 @@ export default defineChannelPluginEntry({
       },
     });
 
-    // --- Health check + fallback to polling ---
-    try {
-      // Attempt a lightweight API call as health check
-      await bot.api.getMyInfo?.();
-      webhookActive = true;
-      api.logger.info("[MAX Plugin] Webhook mode active (health check passed)");
-    } catch (err: any) {
-      api.logger.warn("[MAX Plugin] Webhook health check failed, falling back to polling: " + err.message);
+    // --- Transport selection: webhook if a public URL is configured, else polling ---
+    let webhookActive = false;
+    if (section?.webhookUrl) {
+      try {
+        await bot.api.getMyInfo();
+        const resp = await fetch(`${baseUrl}/subscriptions`, {
+          method: "POST",
+          headers: { "content-type": "application/json", Authorization: token },
+          body: JSON.stringify({
+            url: section.webhookUrl,
+            update_types: ["message_created", "bot_started"],
+            ...(section.webhookSecret ? { secret: section.webhookSecret } : {}),
+          }),
+        });
+        if (!resp.ok) {
+          throw new Error(`POST /subscriptions failed: HTTP ${resp.status} ${await resp.text()}`);
+        }
+        webhookActive = true;
+        api.logger.info(`[MAX] Webhook subscribed: ${section.webhookUrl}`);
+      } catch (err: any) {
+        api.logger.warn(`[MAX] Webhook subscription failed, falling back to polling: ${err.message}`);
+      }
     }
 
     if (!webhookActive) {
-      // Fallback: polling mode
       bot.on("message_created", async (ctx: any) => {
-        const message = ctx.message;
-        const user = ctx.user;
-        const messageId = message.id;
-
-        if (isDuplicate(Number(messageId))) {
-          return;
+        try {
+          await handleUpdate(api, ctx.update ?? { update_type: "message_created", message: ctx.message }, token);
+        } catch (err: any) {
+          api.logger.error("[MAX] polling update failed: " + (err?.message ?? err));
         }
-
-        const numericMessageId = Number(messageId);
-        const inbound = await buildInboundContext({
-          api: api!,
-          messageId: numericMessageId,
-          text: message.text || null,
-          senderId: String(user.user_id),
-          senderName: user.name || "Unknown",
-          chatId: String(message.chat_id),
-          chatType: message.chat_type || "dialog",
-          attachments: message.attachments || undefined,
-          token,
-        });
-
-        if (!api.runtime) {
-          api.logger.warn("[MAX Plugin] api.runtime not available, skipping inbound (polling)");
-          return;
+      });
+      bot.on("bot_started", async (ctx: any) => {
+        try {
+          await handleUpdate(api, ctx.update ?? ctx, token);
+        } catch (err: any) {
+          api.logger.error("[MAX] bot_started handling failed: " + (err?.message ?? err));
         }
-
-        await api.runtime.channel.inbound.run(inbound);
       });
 
       bot
-        .start({ allowedUpdates: ["message_created"] })
+        .start({ allowedUpdates: ["message_created", "bot_started"] })
+        .then(() => api.logger.info("[MAX] Long polling started"))
         .catch((err: any) => {
-          api.logger.error("[MAX Plugin] Failed to start bot polling: " + err.message);
+          api.logger.error("[MAX] Failed to start bot polling: " + err.message);
         });
     }
   },

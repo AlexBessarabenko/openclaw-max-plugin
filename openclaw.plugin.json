@@ -21,13 +21,31 @@
           "allowFrom": {
             "type": "array",
             "items": { "type": "string" }
-          }
+          },
+          "dmPolicy": {
+            "type": "string",
+            "enum": ["open", "allowlist", "closed"]
+          },
+          "webhookUrl": { "type": "string" },
+          "webhookSecret": { "type": "string" },
+          "apiBaseUrl": { "type": "string" }
         }
       },
       "uiHints": {
         "token": {
           "label": "Bot token",
           "sensitive": true
+        },
+        "webhookUrl": {
+          "label": "Public webhook URL (https://host/max/webhook). Empty = long polling"
+        },
+        "webhookSecret": {
+          "label": "Webhook secret (X-Max-Bot-Api-Secret)",
+          "sensitive": true
+        },
+        "apiBaseUrl": {
+          "label": "MAX API base URL",
+          "placeholder": "https://platform-api2.max.ru"
         }
       }
     }

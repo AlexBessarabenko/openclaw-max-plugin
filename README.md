@@ -1,23 +1,20 @@
 # OpenClaw MAX Messenger Plugin
 
-Plugin for connecting OpenClaw to [MAX Messenger](https://max.ru) — Russian messaging platform with 30+ million users.
-Tested with OpenClaw 2026.5.28
+Channel plugin connecting OpenClaw to [MAX Messenger](https://max.ru) — Russian messaging platform.
+Tested with OpenClaw **2026.7.1**, MAX Bot API v2 (`platform-api2.max.ru`).
 
 ## Features
 
-- ✅ Two-way messaging (receive and send)
-- ✅ Markdown formatting support
-- ✅ Webhook primary + Long Polling fallback
-- ✅ DM security with allowlist
-- ✅ Pairing/approval flow for new contacts
-- ✅ Session persistence
-- ✅ Works with both direct messages and group chats
-- ✅ **Media support** — handles images, audio, video, and file attachments
-- ✅ **Audio transcription** — voice messages are transcribed via Groq Whisper API
-- ✅ **Message deduplication** — prevents duplicate processing from webhook + polling overlap
-- ✅ **Typing indicator**
-- ✅ **PDF document analysis** — PDF files are processed via configured PDF model
-- ✅ **Image analysis** — photos are analyzed via configured image model (multimodal)
+- ✅ Two-way messaging (text, Markdown, 4000-char chunking)
+- ✅ **MAX Bot API v2** — `platform-api2.max.ru` by default, bundled Минцифры CA certificates
+- ✅ Webhook (auto-subscription, `X-Max-Bot-Api-Secret` validation, immediate 200 ACK) + Long Polling fallback
+- ✅ **Correct per-chat sessions** — canonical OpenClaw session keys, session recording and last-route updates (context no longer resets between messages)
+- ✅ DM security (`dmPolicy`: open/allowlist/closed) + pairing flow for new contacts
+- ✅ Direct messages and group chats (group sessions isolated per chat)
+- ✅ **Media support** — images, video and files are downloaded into the OpenClaw media store and analyzed by the configured multimodal models
+- ✅ **Voice transcription** — audio messages transcribed via Groq Whisper
+- ✅ `bot_started` support — the "Начать" button becomes `/start` (deep-link payload appended)
+- ✅ Typing indicator with keepalive, bot-loop protection, message deduplication
 
 ## Installation
 
@@ -51,7 +48,7 @@ npm run build
 
 ## Configuration
 
-Add to your OpenClaw config (`~/.openclaw/config.json`):
+`~/.openclaw/config.json`:
 
 ```json
 {
@@ -59,25 +56,70 @@ Add to your OpenClaw config (`~/.openclaw/config.json`):
     "max": {
       "token": "YOUR_MAX_BOT_TOKEN",
       "dmPolicy": "allowlist",
-      "allowFrom": ["123456789"]
+      "allowFrom": ["123456789"],
+      "webhookUrl": "https://your-host/max/webhook",
+      "webhookSecret": "random-long-secret"
     }
   }
 }
 ```
 
-Or set environment variable:
+| Option | Description |
+|--------|-------------|
+| `token` | Bot token from [MAX for Partners](https://partners.max.ru) (required) |
+| `dmPolicy` | `allowlist` (default), `open`, `closed` — who can DM the bot |
+| `allowFrom` | MAX user IDs allowed when policy is `allowlist` |
+| `webhookUrl` | Public URL of the `/max/webhook` route. When set, the plugin subscribes via `POST /subscriptions` automatically. When empty — long polling |
+| `webhookSecret` | Optional secret; verified against the `X-Max-Bot-Api-Secret` header |
+| `apiBaseUrl` | API override, default `https://platform-api2.max.ru` |
+
+For voice transcription also set `GROQ_API_KEY`.
+
+### TLS certificates (platform-api2.max.ru)
+
+`platform-api2.max.ru` uses a certificate chained to the Russian national root CA
+(Минцифры / "Russian Trusted Root CA"), which Node.js does not trust out of the box.
+The plugin ships the required PEM files in `certs/` and installs them at startup via
+`tls.setDefaultCACertificates` (Node ≥ 22.15) — no manual steps needed.
+
+On older Node versions, install the certificates system-wide:
+
 ```bash
-export MAX_BOT_TOKEN=***
+sudo cp certs/*.crt /usr/local/share/ca-certificates/mincifry/
+sudo update-ca-certificates
+export NODE_EXTRA_CA_CERTS=/etc/ssl/certs/russian_trusted_root_ca_pem.pem
 ```
 
-For audio transcription, also set:
-```bash
-export GROQ_API_KEY=***
-```
+## How sessions behave (context within one chat)
 
-### Multimodal Models (Images & PDFs)
+- Every DM partner gets their own session (`agent:<id>:max:default:direct:<userId>`), every group chat gets its own session. Context persists across messages.
+- By default OpenClaw resets sessions **daily at 04:00** (`session.reset`) and honors `/new` and `/reset`. Tune via `session.reset`, `session.resetByType.{dm,group}`, `session.resetByChannel.max` or `session.idleMinutes` in the OpenClaw config.
+- "🧹 Compacting context…" is **compaction** (history is summarized, not wiped). Configure via `agents.defaults.compaction.notifyUser` / `agents.defaults.compaction.model`.
+- Session state lives in the agent store (`~/.openclaw/agents/<agentId>/sessions/sessions.json`); `bindings[]` routing of MAX peers to specific agents is respected.
 
-To enable image and PDF analysis, configure multimodal-capable models in your OpenClaw config:
+## Usage
+
+### Webhook (recommended)
+
+Set `webhookUrl` to the public address of your gateway's `/max/webhook` route — the plugin registers the subscription with MAX itself (`update_types: message_created, bot_started`). Set `webhookSecret` so MAX signs deliveries.
+
+### Long polling
+
+Leave `webhookUrl` empty — the plugin polls `GET /updates` automatically.
+
+### Supported message types
+
+| Type | Incoming | Outgoing | Notes |
+|------|----------|----------|-------|
+| Text | ✅ | ✅ | Markdown, chunked at 4000 chars |
+| Images | ✅ | ✅ | Saved to media store, analyzed via imageModel |
+| Audio/Voice | ✅ | ⚠️ | Transcribed via Groq Whisper |
+| Video | ✅ | ⚠️ | Saved to media store |
+| Files | ✅ | ⚠️ | PDFs analyzed via pdfModel |
+| `bot_started` | ✅ | — | Becomes `/start [payload]` |
+| Group chats | ✅ | ✅ | Per-chat sessions |
+
+### Multimodal models (images & PDFs)
 
 ```json
 {
@@ -90,186 +132,34 @@ To enable image and PDF analysis, configure multimodal-capable models in your Op
 }
 ```
 
-Supported models:
-- `kimi/kimi-for-coding` — Kimi (Moonshot AI), supports images and PDFs
-- `openrouter/auto` — Auto-selected multimodal model via OpenRouter
-- Other OpenRouter multimodal models
-
-### Getting a Bot Token
-
-1. Go to [MAX for Partners](https://partners.max.ru)
-2. Create a new bot
-3. Copy the token from bot settings
-
-## Usage
-
-Once configured, the bot will:
-- Receive messages from MAX users (text, images, audio, video, files)
-- Transcribe voice messages to text via Groq Whisper
-- Analyze images and PDFs via configured multimodal models
-- Process them through OpenClaw agent
-- Send replies back to MAX
-
-### Webhook Setup (Recommended)
-
-1. Register webhook URL in MAX bot settings:
-   ```
-   https://your-openclaw-instance/max/webhook
-   ```
-2. The plugin automatically uses webhook mode if the health check passes
-3. Falls back to Long Polling if webhook is unavailable
-
-### Supported Message Types
-
-| Type | Incoming | Outgoing | Notes |
-|------|----------|----------|-------|
-| Text | ✅ | ✅ | Markdown formatting |
-| Images | ✅ | ✅ | Analyzed via imageModel (multimodal) |
-| Audio/Voice | ✅ | ⚠️ | Transcribed via Groq Whisper |
-| Video | ✅ | ⚠️ | Received as placeholder |
-| Files | ✅ | ⚠️ | PDFs analyzed via pdfModel |
-| Group chats | ✅ | ✅ | Basic support |
-
-## Architecture
-
-```
-MAX User → MAX API → Webhook/Polling → OpenClaw Plugin → Agent → Reply → MAX API → User
-                              ↓
-                    [Audio] → Groq Whisper → Text
-                    [Image] → Image Model (Kimi, etc.)
-                    [PDF]   → PDF Model (Kimi, etc.)
-```
-
-## API Reference
-
-### Webhook Endpoint
-
-Default webhook path: `/max/webhook`
-
-Configure in MAX bot settings to point to your OpenClaw instance.
-
-### Audio Transcription
-
-Voice messages are automatically:
-1. Downloaded from MAX servers
-2. Sent to Groq Whisper API (`whisper-large-v3`, Russian language)
-3. Transcribed text appended to message as `[Voice]: <transcription>`
-
-Requires `GROQ_API_KEY` environment variable.
-
-### Image Analysis
-
-Photos are automatically:
-1. Downloaded from MAX servers (via `payload.ls[0]` or `payload.url`)
-2. Passed to configured `imageModel` (e.g., `kimi/kimi-for-coding`)
-3. Analyzed with prompt "Что изображено на фото?"
-
-### PDF Analysis
-
-PDF files are automatically:
-1. Downloaded from MAX servers (via `payload.url`)
-2. Passed to configured `pdfModel` (e.g., `kimi/kimi-for-coding`)
-3. Text extracted and analyzed
-
-### Message Deduplication
-
-The plugin maintains an in-memory deduplication cache (5-minute TTL) to prevent processing the same message twice when both webhook and polling are active during fallback transitions.
-
-### MAX Attachment Payload Structures
-
-The plugin handles different MAX API payload structures:
-
-**Images:**
-```json
-{
-  "type": "image",
-  "payload": {
-    "photo_id": 12345,
-    "token": "***",
-    "ls": ["https://i.oneme.ru/i?r=..."]
-  }
-}
-```
-
-**Files:**
-```json
-{
-  "type": "file",
-  "payload": {
-    "url": "https://fd.oneme.ru/getfile?sig=...",
-    "token": "***",
-    "fileId": 12345,
-    "filename": "document.pdf",
-    "size": 123456
-  }
-}
-```
-
-**Audio:**
-```json
-{
-  "type": "audio",
-  "payload": {
-    "url": "https://...",
-    "token": "***"
-  }
-}
-```
-
 ## Development
 
 ```bash
-# Watch mode
-npm run dev
-
-# Build
-npm run build
+npm run dev    # watch mode
+npm run build  # build to dist/
 ```
 
 ## Troubleshooting
 
-### No image/PDF analysis
-- Check that `imageModel` and `pdfModel` are configured in OpenClaw config
-- Verify the model supports multimodal input (images + text)
-- Check logs for `[tools] image failed: No image model is configured`
+### Bot is silent
+- Check the token (`GET /me` is verified at startup in webhook mode)
+- Without `webhookUrl` the plugin uses polling — make sure no webhook is stuck in MAX (delete it in bot settings)
+- With `dmPolicy: "allowlist"`, add your MAX user ID to `allowFrom`
 
-### Audio not transcribed
-- Verify `GROQ_API_KEY` is set
-- Check Groq API limits and availability
+### TLS errors to platform-api2.max.ru
+- Update to plugin ≥ 0.2.0 (bundles the Минцифры CAs) or install them system-wide (see above)
 
-### Duplicate messages
-- Deduplication is automatic (5-min TTL)
-- Check logs for `Duplicate message ... ignored`
-
-### Webhook not working
-- Ensure webhook URL is accessible from internet
-- Check firewall/proxy settings
-- Plugin falls back to polling automatically
-
-## Contributing
-
-1. Fork the repository
-2. Create a feature branch
-3. Make your changes
-4. Submit a pull request
+### Context feels reset
+- Daily 04:00 reset and `/new` are default OpenClaw behavior, not a bug — see "How sessions behave"
+- Repeated 🧹 notices on small-context models were fixed in OpenClaw 2026.7.1 (#100621)
 
 ## License
 
-MIT License — see [LICENSE](LICENSE) file.
+MIT — see [LICENSE](LICENSE).
 
 ## Links
 
-- [MAX API Documentation](https://dev.max.ru/docs-api)
-- [MAX Bot SDK](https://github.com/max-messenger/max-bot-api-client-ts)
-- [OpenClaw Documentation](https://docs.openclaw.ai)
-- [Groq Whisper API](https://console.groq.com/docs/speech-text)
-- [Kimi](https://kimi.com)
-
-## Support
-
-- GitHub Issues: [github.com/AlexBessarabenko/openclaw-max-plugin/issues](https://github.com/AlexBessarabenko/openclaw-max-plugin/issues)
-- MAX Developer Community: [dev.max.ru](https://dev.max.ru)
-
----
-
-Made with ❤️ for the OpenClaw community
+- [MAX Bot API docs](https://dev.max.ru/docs-api)
+- [max-bot-api-client-ts](https://github.com/max-messenger/max-bot-api-client-ts)
+- [OpenClaw](https://github.com/openclaw/openclaw)
+- Issues: [github.com/AlexBessarabenko/openclaw-max-plugin/issues](https://github.com/AlexBessarabenko/openclaw-max-plugin/issues)

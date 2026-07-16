@@ -2,33 +2,49 @@ import { createChatChannelPlugin } from "openclaw/plugin-sdk/channel-core";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/channel-core";
 import { Bot } from "@maxhub/max-bot-api";
 
-type ResolvedAccount = {
+export const MAX_CHANNEL_ID = "max";
+export const DEFAULT_ACCOUNT_ID = "default";
+/** MAX Bot API v2 base URL (platform-api.max.ru is deprecated since 2026-07-19). */
+export const DEFAULT_API_BASE_URL = "https://platform-api2.max.ru";
+
+export type ResolvedAccount = {
   accountId: string | null;
   token: string;
   allowFrom: string[];
   dmPolicy: string | undefined;
+  webhookUrl: string | undefined;
+  webhookSecret: string | undefined;
+  apiBaseUrl: string;
 };
 
 function resolveAccountId(params: {
   cfg: OpenClawConfig;
   accountId?: string;
 }): string {
-  return params.accountId ?? "default";
+  return params.accountId ?? DEFAULT_ACCOUNT_ID;
 }
 
 function resolveAccount(
   cfg: OpenClawConfig,
   accountId?: string | null,
 ): ResolvedAccount {
-  const section = (cfg.channels as Record<string, any>)?.["max"];
+  const section = (cfg.channels as Record<string, any>)?.[MAX_CHANNEL_ID];
   const token = section?.token;
   if (!token) throw new Error("max: token is required");
   return {
     accountId: accountId ?? null,
     token,
     allowFrom: section?.allowFrom ?? [],
-    dmPolicy: section?.dmSecurity,
+    dmPolicy: section?.dmPolicy,
+    webhookUrl: section?.webhookUrl,
+    webhookSecret: section?.webhookSecret,
+    apiBaseUrl: section?.apiBaseUrl ?? DEFAULT_API_BASE_URL,
   };
+}
+
+/** Strip routing prefixes ("max:", "max:group:") from a delivery target. */
+export function stripMaxTarget(target: string): string {
+  return target.replace(/^max:(group:)?/, "");
 }
 
 // Store bot instance for outbound messaging
@@ -36,9 +52,9 @@ let botInstance: Bot | null = null;
 
 export const maxPlugin = createChatChannelPlugin<ResolvedAccount>({
   base: {
-    id: "max",
+    id: MAX_CHANNEL_ID,
     meta: {
-      id: "max",
+      id: MAX_CHANNEL_ID,
       label: "MAX Messenger",
       selectionLabel: "MAX Messenger (plugin)",
       blurb: "Connect OpenClaw to MAX messenger.",
@@ -60,7 +76,7 @@ export const maxPlugin = createChatChannelPlugin<ResolvedAccount>({
     config: {
       resolveAccount,
       listAccountIds(cfg) {
-        return ["default"];
+        return [DEFAULT_ACCOUNT_ID];
       },
     },
   },
@@ -68,7 +84,7 @@ export const maxPlugin = createChatChannelPlugin<ResolvedAccount>({
   // DM security: who can message the bot
   security: {
     dm: {
-      channelKey: "max",
+      channelKey: MAX_CHANNEL_ID,
       resolvePolicy: (account) => account.dmPolicy,
       resolveAllowFrom: (account) => account.allowFrom,
       defaultPolicy: "allowlist",
@@ -89,7 +105,7 @@ export const maxPlugin = createChatChannelPlugin<ResolvedAccount>({
       }) => {
         if (botInstance) {
           await botInstance.api.sendMessageToUser(
-            Number(params.id),
+            Number(stripMaxTarget(params.id)),
             params.message,
             { format: "markdown" }
           );
@@ -107,25 +123,30 @@ export const maxPlugin = createChatChannelPlugin<ResolvedAccount>({
       deliveryMode: "direct",
     },
     attachedResults: {
-      channel: "max",
+      channel: MAX_CHANNEL_ID,
       sendText: async (params) => {
         if (!botInstance) {
           throw new Error("MAX bot not initialized");
         }
-        await botInstance.api.sendMessageToUser(
-          Number(params.to),
+        // chat_id works uniformly for dialogs, groups and channels
+        const sent = await botInstance.api.sendMessageToChat(
+          Number(stripMaxTarget(params.to)),
           params.text,
           { format: "markdown" }
         );
-        return { messageId: String(Date.now()) };
+        // the api client returns the raw response ({ message: {...} })
+        const mid = (sent as any)?.message?.body?.mid ?? (sent as any)?.body?.mid ?? (sent as any)?.id;
+        return { messageId: mid != null ? String(mid) : String(Date.now()) };
       },
     },
   },
 });
 
 // Initialize bot function
-export function initializeBot(token: string): Bot {
-  botInstance = new Bot(token);
+export function initializeBot(token: string, apiBaseUrl?: string): Bot {
+  botInstance = new Bot(token, {
+    clientOptions: { baseUrl: apiBaseUrl ?? DEFAULT_API_BASE_URL },
+  });
   return botInstance;
 }
 

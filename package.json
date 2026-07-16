@@ -1,6 +1,6 @@
 {
   "name": "@alexbessarabenko/openclaw-max",
-  "version": "0.1.2",
+  "version": "0.2.0",
   "description": "MAX messenger channel plugin for OpenClaw",
   "type": "module",
   "main": "./dist/index.js",
@@ -10,17 +10,18 @@
     "dev": "tsc --watch"
   },
   "dependencies": {
-    "@maxhub/max-bot-api": "^0.2.2"
+    "@maxhub/max-bot-api": "^0.2.5"
   },
   "devDependencies": {
     "@types/node": "^22.5.5",
     "typescript": "^5.4.2"
   },
   "peerDependencies": {
-    "openclaw": "^2026.5.28"
+    "openclaw": "^2026.7.1"
   },
   "files": [
     "dist/",
+    "certs/",
     "openclaw.plugin.json",
     "README.md",
     "LICENSE"
@@ -35,12 +36,12 @@
     "setupEntry": "./setup-entry.ts",
     "runtimeSetupEntry": "./dist/setup-entry.js",
     "compat": {
-      "pluginApi": ">=2026.5.28",
-      "minGatewayVersion": "2026.5.28"
+      "pluginApi": ">=2026.7.1",
+      "minGatewayVersion": "2026.7.1"
     },
     "build": {
-      "openclawVersion": "2026.5.28",
-      "pluginSdkVersion": "2026.5.28"
+      "openclawVersion": "2026.7.1",
+      "pluginSdkVersion": "2026.7.1"
     },
     "channel": {
       "id": "max",
