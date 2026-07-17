@@ -163,6 +163,8 @@ Leave `webhookUrl` empty — the plugin polls `GET /updates` automatically.
 | Video | ✅ | ⚠️ | Saved to media store |
 | Files | ✅ | ⚠️ | PDFs analyzed via pdfModel |
 | `bot_started` | ✅ | — | Becomes `/start [payload]` |
+| Forwarded | ✅ | — | Content unwrapped from `link.message`, marked `[Forwarded from …]`; media processed as usual |
+| Replies | ✅ | — | Quoted original shown as `[Reply to …: "…"]` (≤200 chars) |
 | Group chats | ✅ | ✅ | Per-chat sessions |
 
 ### Multimodal models (images & PDFs)

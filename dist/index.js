@@ -42,16 +42,44 @@ function extractInboundFacts(update) {
         const senderName = sender.name ||
             [sender.first_name, sender.last_name].filter(Boolean).join(" ") ||
             "Unknown";
+        // Forwards with visible attribution carry the content in link.message (body
+        // is empty); hidden-attribution forwards and replies keep content in body.
+        const link = m.link ?? undefined;
+        const linkBody = link?.message ?? {};
+        let text = body.text ?? m.text ?? "";
+        let attachments = m.attachments ?? body.attachments ?? undefined;
+        const linkSenderName = link
+            ? link.sender?.name ||
+                [link.sender?.first_name, link.sender?.last_name].filter(Boolean).join(" ")
+            : "";
+        if (link?.type === "forward") {
+            if (!text && linkBody.text)
+                text = linkBody.text;
+            if (!attachments && linkBody.attachments)
+                attachments = linkBody.attachments;
+            const marker = linkSenderName ? `[Forwarded from ${linkSenderName}]` : "[Forwarded]";
+            text = text ? `${marker}\n${text}` : marker;
+        }
+        else if (link?.type === "reply") {
+            const quote = typeof linkBody.text === "string"
+                ? linkBody.text.replace(/\s+/g, " ").trim()
+                : "";
+            const clipped = quote.length > 200 ? `${quote.slice(0, 199)}…` : quote;
+            const marker = clipped
+                ? `[Reply to ${linkSenderName || "unknown"}: "${clipped}"]`
+                : `[Reply to ${linkSenderName || "unknown"}]`;
+            text = text ? `${marker}\n${text}` : marker;
+        }
         return {
             messageId: String(body.mid ?? m.id ?? `${chatId}:${body.seq ?? m.timestamp ?? Date.now()}`),
-            text: body.text ?? m.text ?? "",
+            text,
             senderId: String(senderId),
             senderName,
             senderIsBot: Boolean(sender.is_bot),
             chatId: String(chatId),
             isGroup: (recipient.chat_type ?? m.chat_type ?? "dialog") !== "dialog",
             timestamp: m.timestamp,
-            attachments: m.attachments ?? body.attachments ?? undefined,
+            attachments,
         };
     }
     // "Начать" button pressed in a dialog; payload carries the deep-link parameter
