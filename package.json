@@ -1,7 +1,8 @@
 {
   "name": "@alexbessarabenko/openclaw-max",
-  "version": "0.3.2",
+  "version": "0.3.3",
   "description": "MAX messenger channel plugin for OpenClaw",
+  "license": "MIT",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
