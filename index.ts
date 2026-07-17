@@ -3,10 +3,6 @@ import { createTypingCallbacks } from "openclaw/plugin-sdk/channel-reply-pipelin
 import { getBot, initializeBot, maxPlugin, DEFAULT_ACCOUNT_ID, MAX_CHANNEL_ID } from "./channel.js";
 import { ensureRussianTrustedCAs } from "./certs.js";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk/channel-core";
-import { unlinkSync } from "fs";
-import { writeFile } from "fs/promises";
-import { tmpdir } from "os";
-import { join } from "path";
 
 /** MAX caps message text at 4000 chars. */
 const MAX_TEXT_LIMIT = 4000;
@@ -34,47 +30,6 @@ function chunkText(text: string, limit: number): string[] {
     chunks.push(text.slice(i, i + limit));
   }
   return chunks.length > 0 ? chunks : [""];
-}
-
-// Groq Whisper transcription
-async function transcribeAudio(url: string, token: string, logger: any): Promise<string | null> {
-  const tmpPath = join(tmpdir(), `max-audio-${Date.now()}.ogg`);
-  try {
-    const resp = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
-    if (!resp.ok) throw new Error(`Download failed: ${resp.status}`);
-    const buf = await resp.arrayBuffer();
-    await writeFile(tmpPath, Buffer.from(buf));
-
-    const groqKey = process.env.GROQ_API_KEY;
-    if (!groqKey) {
-      logger.warn("[MAX] GROQ_API_KEY not set, skipping transcription");
-      return null;
-    }
-
-    const form = new FormData();
-    form.append("file", new Blob([Buffer.from(buf)]), "audio.ogg");
-    form.append("model", "whisper-large-v3");
-    form.append("language", "ru");
-
-    const groqResp = await fetch("https://api.groq.com/openai/v1/audio/transcriptions", {
-      method: "POST",
-      headers: { Authorization: `Bearer ${groqKey}` },
-      body: form,
-    });
-
-    if (!groqResp.ok) {
-      const errText = await groqResp.text();
-      throw new Error(`Groq transcription failed: ${groqResp.status} ${errText}`);
-    }
-
-    const groqJson = (await groqResp.json()) as { text?: string };
-    return groqJson.text || null;
-  } catch (err: any) {
-    logger.error("[MAX] Audio transcription error: " + err.message);
-    return null;
-  } finally {
-    try { unlinkSync(tmpPath); } catch { /* ignore */ }
-  }
 }
 
 type InboundFacts = {
@@ -166,6 +121,28 @@ async function downloadAttachment(url: string, token?: string): Promise<Buffer> 
   return Buffer.from(await resp.arrayBuffer());
 }
 
+/**
+ * Transcribe a saved audio file through the core media-understanding pipeline.
+ * Provider, API key and language all come from the gateway operator's
+ * `tools.media.audio` config; returns null when no STT provider is configured.
+ */
+async function transcribeSavedAudio(
+  api: OpenClawPluginApi,
+  filePath: string,
+  mime: string,
+): Promise<string | null> {
+  const mu = (api as any).runtime?.mediaUnderstanding;
+  if (!mu?.transcribeAudioFile) return null;
+  try {
+    const cfg = (api as any).runtime.config.current();
+    const res = await mu.transcribeAudioFile({ filePath, cfg, mime });
+    return res?.text ?? null;
+  } catch (err: any) {
+    api.logger.warn(`[MAX] audio transcription skipped: ${err.message}`);
+    return null;
+  }
+}
+
 type MediaFact = {
   path?: string;
   url?: string;
@@ -174,7 +151,7 @@ type MediaFact = {
   transcribed?: boolean;
 };
 
-/** Download attachments into the media store; transcribe voice via Groq. */
+/** Download attachments into the media store; voice is transcribed by the core media-understanding pipeline (`tools.media.audio`). */
 async function buildTextAndMedia(
   api: OpenClawPluginApi,
   facts: InboundFacts,
@@ -189,9 +166,34 @@ async function buildTextAndMedia(
     if (!url) continue;
 
     if (att.type === "audio") {
-      const transcription = await transcribeAudio(url, att?.payload?.token ?? token, api.logger);
-      if (transcription) {
-        text = text ? `${text}\n[Voice]: ${transcription}` : `[Voice]: ${transcription}`;
+      const audioContentType = att?.payload?.contentType ?? "audio/ogg";
+      try {
+        const buf = await downloadAttachment(url, att?.payload?.token ?? token);
+        if (!rt?.media?.saveMediaBuffer) {
+          media.push({ url, contentType: audioContentType, kind: "audio" });
+          continue;
+        }
+        const saved = await rt.media.saveMediaBuffer(
+          buf,
+          audioContentType,
+          "inbound",
+          undefined,
+          att?.payload?.filename,
+        );
+        const transcript = await transcribeSavedAudio(api, saved.path, saved.contentType ?? audioContentType);
+        if (transcript) {
+          text = text ? `${text}\n[Voice]: ${transcript}` : `[Voice]: ${transcript}`;
+        }
+        media.push({
+          path: saved.path,
+          url: saved.path,
+          contentType: saved.contentType ?? audioContentType,
+          kind: "audio",
+          transcribed: Boolean(transcript),
+        });
+      } catch (err: any) {
+        api.logger.warn(`[MAX] audio attachment handling failed: ${err.message}`);
+        media.push({ url, contentType: audioContentType, kind: "audio" });
       }
       continue;
     }

@@ -12,7 +12,7 @@ Tested with OpenClaw **2026.7.1**, MAX Bot API v2 (`platform-api2.max.ru`).
 - ✅ DM security (`dmPolicy`: open/allowlist/closed) + pairing flow for new contacts
 - ✅ Direct messages and group chats (group sessions isolated per chat)
 - ✅ **Media support** — images, video and files are downloaded into the OpenClaw media store and analyzed by the configured multimodal models
-- ✅ **Voice transcription** — audio messages transcribed via Groq Whisper
+- ✅ **Voice transcription** — audio messages transcribed by the gateway's media-understanding pipeline (`tools.media.audio`, e.g. Groq Whisper) — no keys or uploads handled by the plugin itself
 - ✅ `bot_started` support — the "Начать" button becomes `/start` (deep-link payload appended)
 - ✅ Typing indicator with keepalive, bot-loop protection, message deduplication
 
@@ -73,7 +73,35 @@ npm run build
 | `webhookSecret` | Optional secret; verified against the `X-Max-Bot-Api-Secret` header |
 | `apiBaseUrl` | API override, default `https://platform-api2.max.ru` |
 
-For voice transcription also set `GROQ_API_KEY`.
+### Voice transcription
+
+Since plugin **0.3.0**, transcription runs through the gateway's media-understanding
+pipeline — the plugin itself holds no API keys and uploads nothing to third parties.
+Enable and configure `tools.media.audio` in `~/.openclaw/openclaw.json`, and supply
+the provider key to the **gateway** (e.g. `env.GROQ_API_KEY`, or the official Groq
+provider plugin):
+
+```json
+{
+  "tools": {
+    "media": {
+      "audio": {
+        "enabled": true,
+        "language": "ru",
+        "models": [{ "provider": "groq", "model": "whisper-large-v3" }]
+      }
+    }
+  }
+}
+```
+
+`language` is an operator choice — omit it for provider auto-detection. With no STT
+provider configured, voice messages are delivered as audio attachments, untranscribed.
+
+**Migrating from 0.2.x:** up to 0.2.1 the plugin read `GROQ_API_KEY` from the
+environment itself and sent audio to Groq with a hardcoded Russian locale. If you
+relied on that, add the `tools.media.audio` block above — a 1:1 replacement that is
+additionally consent-gated and locale-configurable.
 
 ### TLS certificates (platform-api2.max.ru)
 
@@ -89,6 +117,24 @@ sudo cp certs/*.crt /usr/local/share/ca-certificates/mincifry/
 sudo update-ca-certificates
 export NODE_EXTRA_CA_CERTS=/etc/ssl/certs/russian_trusted_root_ca_pem.pem
 ```
+
+## ⚠️ Privacy & Consent Notice
+
+This plugin talks **only** to the MAX Bot API. Any AI processing of message content
+is performed by the OpenClaw gateway under the operator's control:
+
+- **Voice / audio** is sent to a speech-to-text provider (e.g. Groq Whisper) **only**
+  when the operator has explicitly enabled and configured `tools.media.audio` —
+  provider, model, language and API key are all operator-chosen. With no STT provider
+  configured, audio never leaves the gateway for transcription.
+- **Images and PDFs** are analyzed **only** by the models the operator set in
+  `agents.defaults.imageModel` / `agents.defaults.pdfModel`; that content leaves the
+  host only towards those operator-configured providers.
+- The plugin reads no third-party API keys and uploads nothing on its own.
+
+If you operate this bot, inform your users — in DMs and especially in group chats —
+that their messages and media may be processed by the third-party AI providers you
+have configured.
 
 ## How sessions behave (context within one chat)
 
@@ -113,7 +159,7 @@ Leave `webhookUrl` empty — the plugin polls `GET /updates` automatically.
 |------|----------|----------|-------|
 | Text | ✅ | ✅ | Markdown, chunked at 4000 chars |
 | Images | ✅ | ✅ | Saved to media store, analyzed via imageModel |
-| Audio/Voice | ✅ | ⚠️ | Transcribed via Groq Whisper |
+| Audio/Voice | ✅ | ⚠️ | Transcribed via gateway STT (`tools.media.audio`) |
 | Video | ✅ | ⚠️ | Saved to media store |
 | Files | ✅ | ⚠️ | PDFs analyzed via pdfModel |
 | `bot_started` | ✅ | — | Becomes `/start [payload]` |
