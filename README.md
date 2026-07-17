@@ -27,7 +27,7 @@ openclaw plugins install clawhub:@alexbessarabenko/openclaw-max
 ### Via npm
 
 ```bash
-openclaw plugins install alexbessarabenko-openclaw-max
+openclaw plugins install npm:@alexbessarabenko/openclaw-max
 ```
 
 ### Via GitHub
