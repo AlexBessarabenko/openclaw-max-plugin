@@ -1,8 +1,7 @@
 import { timingSafeEqual } from "node:crypto";
 import { defineChannelPluginEntry } from "openclaw/plugin-sdk/channel-core";
 import { createTypingCallbacks } from "openclaw/plugin-sdk/channel-reply-pipeline";
-import { getBot, maxPlugin, runOutsideInheritedRootWork, setMaxUpdateHandler, DEFAULT_ACCOUNT_ID, MAX_CHANNEL_ID } from "./channel.js";
-import { createMaxScopedFetch } from "./certs.js";
+import { getBot, getMaxFetch, maxPlugin, runOutsideInheritedRootWork, setMaxUpdateHandler, DEFAULT_ACCOUNT_ID, MAX_CHANNEL_ID } from "./channel.js";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk/channel-core";
 
 /** MAX caps message text at 4000 chars. */
@@ -142,12 +141,10 @@ function attachmentNeedsAuth(url: string): boolean {
   }
 }
 
-const maxFetch = createMaxScopedFetch();
-
 async function downloadAttachment(url: string, token?: string): Promise<Buffer> {
   const headers =
     token && attachmentNeedsAuth(url) ? { Authorization: `Bearer ${token}` } : undefined;
-  const resp = await maxFetch(url, headers ? { headers } : undefined);
+  const resp = await getMaxFetch()(url, headers ? { headers } : undefined);
   if (!resp.ok) throw new Error(`download failed: HTTP ${resp.status}`);
   return Buffer.from(await resp.arrayBuffer());
 }
@@ -345,6 +342,66 @@ async function runInbound(api: OpenClawPluginApi, facts: InboundFacts, token: st
           }
         };
 
+        // --- Draft streaming: cumulative partial replies edit one draft message ---
+        const streamingEnabled = (cfg.channels as any)?.[MAX_CHANNEL_ID]?.streaming !== false;
+        const STREAM_EDIT_INTERVAL_MS = 800;
+        const draft = {
+          mid: null as string | null,
+          accumulated: "",
+          lastEditAt: 0,
+          chain: Promise.resolve() as Promise<void>,
+        };
+        const extractMid = (sent: any): string | null => {
+          const mid = sent?.message?.body?.mid ?? sent?.body?.mid ?? sent?.id;
+          return mid != null ? String(mid) : null;
+        };
+        const editDraft = (text: string, final: boolean): Promise<void> => {
+          draft.chain = draft.chain.then(async () => {
+            const bot = getBot();
+            if (!bot || !draft.mid) return;
+            try {
+              await bot.api.editMessage(draft.mid, { text, format: "markdown" });
+            } catch {
+              // invalid markdown must not lose the reply
+              try {
+                await bot.api.editMessage(draft.mid, { text });
+              } catch {
+                // best-effort preview
+              }
+            }
+            draft.lastEditAt = Date.now();
+            if (!final) {
+              // MAX clears the typing indicator on edit — renew it
+              bot.api.sendAction(Number(chatId), "typing_on").catch(() => {});
+            }
+          });
+          return draft.chain;
+        };
+        const onPartialReply = async (payload: any): Promise<boolean> => {
+          if (!streamingEnabled) return false;
+          const text = typeof payload?.text === "string" ? payload.text : "";
+          if (!text.trim()) return false;
+          const bot = getBot();
+          if (!bot) return false;
+          draft.accumulated = text;
+          const preview = text.slice(0, MAX_TEXT_LIMIT - 2) + " …";
+          if (!draft.mid) {
+            try {
+              draft.mid = extractMid(
+                await bot.api.sendMessageToChat(Number(chatId), preview, { format: "markdown" }),
+              );
+            } catch {
+              draft.mid = null;
+            }
+            draft.lastEditAt = Date.now();
+            return Boolean(draft.mid);
+          }
+          // Throttle edits; deliver() writes the authoritative final text
+          if (Date.now() - draft.lastEditAt < STREAM_EDIT_INTERVAL_MS) return true;
+          await editDraft(preview, false);
+          return true;
+        };
+
         return {
           channel: MAX_CHANNEL_ID,
           accountId: route.accountId,
@@ -378,7 +435,27 @@ async function runInbound(api: OpenClawPluginApi, facts: InboundFacts, token: st
                 deliver: async (payload: any) => {
                   const bot = getBot();
                   const out = typeof payload?.text === "string" ? payload.text : "";
-                  if (!bot || !out.trim()) return undefined;
+                  if (!bot) return undefined;
+                  if (draft.mid) {
+                    // The draft exists: edit it into the authoritative final text
+                    // (no cursor), then send any overflow chunks as new messages.
+                    const finalText = out.trim() ? out : draft.accumulated;
+                    const chunks = chunkText(finalText, MAX_TEXT_LIMIT);
+                    await editDraft(chunks[0] ?? "", true);
+                    const messageIds = [draft.mid];
+                    for (const chunk of chunks.slice(1)) {
+                      let sent;
+                      try {
+                        sent = await bot.api.sendMessageToChat(Number(chatId), chunk, { format: "markdown" });
+                      } catch {
+                        sent = await bot.api.sendMessageToChat(Number(chatId), chunk);
+                      }
+                      const mid = extractMid(sent);
+                      if (mid) messageIds.push(mid);
+                    }
+                    return { messageIds };
+                  }
+                  if (!out.trim()) return undefined;
                   const messageIds: string[] = [];
                   for (const chunk of chunkText(out, MAX_TEXT_LIMIT)) {
                     let sent;
@@ -388,8 +465,8 @@ async function runInbound(api: OpenClawPluginApi, facts: InboundFacts, token: st
                       // invalid markdown must not lose the reply
                       sent = await bot.api.sendMessageToChat(Number(chatId), chunk);
                     }
-                    const mid = (sent as any)?.message?.body?.mid ?? (sent as any)?.body?.mid ?? (sent as any)?.id;
-                    if (mid != null) messageIds.push(String(mid));
+                    const mid = extractMid(sent);
+                    if (mid) messageIds.push(mid);
                   }
                   return messageIds.length > 0 ? { messageIds } : undefined;
                 },
@@ -397,6 +474,7 @@ async function runInbound(api: OpenClawPluginApi, facts: InboundFacts, token: st
                   api.logger.error(`[MAX] reply dispatch error: ${err?.message ?? err}`);
                 },
               },
+              replyOptions: { onPartialReply },
             }),
         };
       },

@@ -28,7 +28,9 @@
           },
           "webhookUrl": { "type": "string" },
           "webhookSecret": { "type": "string" },
-          "apiBaseUrl": { "type": "string" }
+          "apiBaseUrl": { "type": "string" },
+          "httpProxy": { "type": "string" },
+          "streaming": { "type": "boolean" }
         }
       },
       "uiHints": {
@@ -46,6 +48,13 @@
         "apiBaseUrl": {
           "label": "MAX API base URL",
           "placeholder": "https://platform-api2.max.ru"
+        },
+        "httpProxy": {
+          "label": "HTTP(S) proxy for MAX API traffic only",
+          "placeholder": "http://user:pass@host:port"
+        },
+        "streaming": {
+          "label": "Stream replies via message edits (default: on)"
         }
       }
     }

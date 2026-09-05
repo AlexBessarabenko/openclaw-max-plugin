@@ -23,6 +23,7 @@ export type ResolvedAccount = {
   webhookUrl: string | undefined;
   webhookSecret: string | undefined;
   apiBaseUrl: string;
+  httpProxy: string | undefined;
 };
 
 function resolveAccountId(params: {
@@ -48,6 +49,7 @@ function resolveAccount(
     webhookUrl: section?.webhookUrl,
     webhookSecret: section?.webhookSecret,
     apiBaseUrl: section?.apiBaseUrl ?? DEFAULT_API_BASE_URL,
+    httpProxy: section?.httpProxy,
   };
 }
 
@@ -58,14 +60,44 @@ export function stripMaxTarget(target: string): string {
 
 /** MAX chat ids: positive = dialog/chat id (not the user id), negative = group/channel. */
 const MAX_TARGET_ID_RE = /^-?\d{5,}$/;
+/** Explicit user-id targets keep the kind prefix: "user:<id>" → sendMessageToUser. */
+const MAX_USER_TARGET_RE = /^user:\d{5,}$/i;
 
-/** Normalize a delivery target: "max:123", "max:group:-45", "chat:123", "user:123" → bare id. */
+/**
+ * Normalize a delivery target: "max:123", "max:group:-45", "chat:123" → bare chat id;
+ * "user:123" / "max:user:123" → "user:123" (kind prefix preserved — a user id is
+ * NOT a chat id: sending it via chat_id fails with 404).
+ */
 export function normalizeMaxTarget(raw: string): string {
-  return String(raw ?? "")
+  const t = String(raw ?? "")
     .trim()
-    .replace(/^max:(group:)?/i, "")
-    .replace(/^(chat|user|group):/i, "")
+    .replace(/^max:/i, "")
     .trim();
+  if (/^user:/i.test(t)) return "user:" + t.slice(5).trim();
+  return t.replace(/^(chat|group):/i, "").trim();
+}
+
+/**
+ * Where to send: bare ids are chat ids (`sendMessageToChat` — works uniformly for
+ * dialogs, groups and channels), `user:`-prefixed ids go through
+ * `sendMessageToUser` (DM by user id).
+ */
+function resolveSendTarget(to: string): { userId: number } | { chatId: number } {
+  const t = normalizeMaxTarget(to);
+  if (MAX_USER_TARGET_RE.test(t)) return { userId: Number(t.slice(5)) };
+  return { chatId: Number(t) };
+}
+
+async function sendMaxMessage(
+  bot: Bot,
+  to: string,
+  text: string,
+  extra?: Record<string, unknown>,
+): Promise<any> {
+  const target = resolveSendTarget(to);
+  return "userId" in target
+    ? bot.api.sendMessageToUser(target.userId, text, extra as any)
+    : bot.api.sendMessageToChat(target.chatId, text, extra as any);
 }
 
 /**
@@ -78,23 +110,30 @@ export function normalizeMaxTarget(raw: string): string {
  * messages are processed, but the agent ends with "visible channel turn
  * dispatched with no queued reply payloads" and the user never gets an answer.
  *
- * Note: for direct chats the delivery target is the **dialog chat id**
- * (positive, differs from the user id); sending to a user id fails with
- * `404 Chat not found`.
+ * Note: for direct chats the bare delivery target is the **dialog chat id**
+ * (positive, differs from the user id). To address a user by their MAX user id
+ * directly, use the explicit `user:<id>` form (sent via sendMessageToUser).
  */
 export const maxMessaging: ChannelMessagingAdapter = {
   targetPrefixes: ["max"],
   normalizeTarget: (raw) => normalizeMaxTarget(raw) || undefined,
   inferTargetChatType: ({ to }) => {
     const id = normalizeMaxTarget(to);
+    if (MAX_USER_TARGET_RE.test(id)) return "direct";
     if (!MAX_TARGET_ID_RE.test(id)) return undefined;
     return id.startsWith("-") ? "group" : "direct";
   },
   targetResolver: {
-    looksLikeId: (raw, normalized) => MAX_TARGET_ID_RE.test(normalizeMaxTarget(normalized ?? raw)),
-    hint: "<chat_id> (MAX chat id: positive = dialog, negative = group/channel; not the user id)",
+    looksLikeId: (raw, normalized) => {
+      const t = normalizeMaxTarget(normalized ?? raw);
+      return MAX_TARGET_ID_RE.test(t) || MAX_USER_TARGET_RE.test(t);
+    },
+    hint: "<chat_id> or user:<user_id> (MAX ids: positive = dialog, negative = group/channel)",
     resolveTarget: async ({ normalized, input }) => {
       const to = normalizeMaxTarget(normalized ?? input);
+      if (MAX_USER_TARGET_RE.test(to)) {
+        return { to, kind: "user", display: to, source: "normalized" };
+      }
       if (!MAX_TARGET_ID_RE.test(to)) return null;
       return {
         to,
@@ -156,8 +195,13 @@ function extractSentMessageId(sent: any): string {
 // Store bot instance for outbound messaging
 let botInstance: Bot | null = null;
 
-/** fetch that trusts the bundled Russian national CAs on MAX hosts only. */
-const maxFetch = createMaxScopedFetch();
+/** Scoped fetch of the currently initialized account (proxy-aware). */
+let maxFetch = createMaxScopedFetch();
+
+/** Scoped fetch for direct calls outside bot init (probes, attachment downloads). */
+export function getMaxFetch() {
+  return maxFetch;
+}
 
 // Inbound updates are processed by the handler registered from the plugin
 // entry (index.ts), where the full plugin api is available.
@@ -197,7 +241,7 @@ type MaxProbe = {
 async function probeMaxAccount(account: ResolvedAccount, timeoutMs: number): Promise<MaxProbe> {
   if (!account.token) return { ok: false, error: "token is not configured" };
   try {
-    const resp = await maxFetch(`${account.apiBaseUrl}/me`, {
+    const resp = await createMaxScopedFetch(undefined, account.httpProxy)(`${account.apiBaseUrl}/me`, {
       headers: { Authorization: account.token },
       signal: AbortSignal.timeout(timeoutMs),
     });
@@ -226,6 +270,24 @@ export const maxPlugin = createChatChannelPlugin<ResolvedAccount, MaxProbe>({
       threads: false,
       media: true,
       nativeCommands: false,
+    },
+    agentPrompt: {
+      messageToolHints: () => [
+        "",
+        "### MAX Messenger formatting",
+        "Markdown: **bold**, *italic*, ~~strikethrough~~, `inline code`, [links](url).",
+        "Hard limit 4000 chars per message; the plugin chunks longer text.",
+        "Delivery target: dialog chat id (positive) or `user:<user_id>` for DMs;",
+        "group/channel ids are negative.",
+        "Attach media via the message tool `media` param (local path or URL).",
+      ],
+      inboundFormattingHints: () => ({
+        text_markup: "markdown",
+        rules: [
+          "Keep answers under 4000 characters",
+          "Avoid wide tables (narrow mobile rendering)",
+        ],
+      }),
     },
     setup: {
       resolveAccountId,
@@ -285,7 +347,7 @@ export const maxPlugin = createChatChannelPlugin<ResolvedAccount, MaxProbe>({
       }) => {
         if (botInstance) {
           await botInstance.api.sendMessageToUser(
-            Number(stripMaxTarget(params.id)),
+            Number(normalizeMaxTarget(params.id).replace(/^user:/i, "")),
             params.message,
             { format: "markdown" }
           );
@@ -306,12 +368,7 @@ export const maxPlugin = createChatChannelPlugin<ResolvedAccount, MaxProbe>({
       channel: MAX_CHANNEL_ID,
       sendText: async (params) => {
         const bot = ensureBotForOutbound(params.cfg);
-        // chat_id works uniformly for dialogs, groups and channels
-        const sent = await bot.api.sendMessageToChat(
-          Number(stripMaxTarget(params.to)),
-          params.text,
-          { format: "markdown" }
-        );
+        const sent = await sendMaxMessage(bot, params.to, params.text, { format: "markdown" });
         return { messageId: extractSentMessageId(sent) };
       },
       sendMedia: async (params) => {
@@ -339,11 +396,9 @@ export const maxPlugin = createChatChannelPlugin<ResolvedAccount, MaxProbe>({
         }
         const uploadType = resolveMaxUploadType(filename, contentType);
         const attachment = await rawUploadMaxMedia(bot, uploadType, data, filename);
-        const sent = await bot.api.sendMessageToChat(
-          Number(stripMaxTarget(params.to)),
-          params.text ?? "",
-          { attachments: [attachment as any] }
-        );
+        const sent = await sendMaxMessage(bot, params.to, params.text ?? "", {
+          attachments: [attachment as any],
+        });
         return { messageId: extractSentMessageId(sent) };
       },
     },
@@ -351,7 +406,7 @@ export const maxPlugin = createChatChannelPlugin<ResolvedAccount, MaxProbe>({
 });
 
 // Initialize bot function
-export function initializeBot(token: string, apiBaseUrl?: string): Bot {
+export function initializeBot(token: string, apiBaseUrl?: string, httpProxy?: string): Bot {
   if (botInstance) {
     try {
       botInstance.stopPolling();
@@ -359,11 +414,13 @@ export function initializeBot(token: string, apiBaseUrl?: string): Bot {
       // previous instance was not polling
     }
   }
+  maxFetch = createMaxScopedFetch(undefined, httpProxy);
   botInstance = new Bot(token, {
     clientOptions: {
       baseUrl: apiBaseUrl ?? DEFAULT_API_BASE_URL,
       // Scoped TLS: Russian national CAs apply to MAX hosts only; the
-      // process-wide trust store is never touched.
+      // process-wide trust store is never touched. Optional proxy tunnels
+      // MAX traffic only.
       fetch: maxFetch as any,
     },
   });
@@ -385,7 +442,7 @@ function ensureBotForOutbound(cfg: OpenClawConfig): Bot {
   if (botInstance) return botInstance;
   const account = resolveAccount(cfg, DEFAULT_ACCOUNT_ID);
   if (!account.token) throw new Error("MAX token is not configured");
-  return initializeBot(account.token, account.apiBaseUrl);
+  return initializeBot(account.token, account.apiBaseUrl, account.httpProxy);
 }
 
 async function runMaxAccount(ctx: ChannelGatewayContext<ResolvedAccount>): Promise<void> {
@@ -408,7 +465,7 @@ async function runMaxAccount(ctx: ChannelGatewayContext<ResolvedAccount>): Promi
   }
   const handler = updateHandler;
 
-  const bot = initializeBot(account.token, account.apiBaseUrl);
+  const bot = initializeBot(account.token, account.apiBaseUrl, account.httpProxy);
   statusSink({ running: true, lastStartAt: Date.now(), lastError: null });
 
   let webhookActive = false;

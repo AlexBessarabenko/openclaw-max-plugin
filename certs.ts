@@ -2,7 +2,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import tls from "node:tls";
 import { fileURLToPath } from "node:url";
-import { Agent } from "undici";
+import { Agent, ProxyAgent } from "undici";
 
 /**
  * MAX API (platform-api2.max.ru) is served with a certificate chained to the
@@ -32,7 +32,8 @@ export function isMaxInfraHost(hostname: string): boolean {
 
 type FetchLike = (input: any, init?: any) => Promise<any>;
 
-let maxDispatcher: Agent | null | undefined;
+// Dispatcher cache keyed by proxy URL ("" = direct connection)
+const dispatchers = new Map<string, Agent | ProxyAgent | null>();
 let logged = false;
 
 type CertLogger = { info?: (msg: string) => void; warn?: (msg: string) => void };
@@ -60,34 +61,41 @@ function loadExtraCAs(logger?: CertLogger): string[] {
   return [];
 }
 
-function getMaxDispatcher(logger?: CertLogger): Agent | null {
-  if (maxDispatcher !== undefined) return maxDispatcher;
+function getMaxDispatcher(logger?: CertLogger, proxyUrl?: string): Agent | ProxyAgent | null {
+  const key = proxyUrl ?? "";
+  const cached = dispatchers.get(key);
+  if (cached !== undefined) return cached;
   const extra = loadExtraCAs(logger);
   if (extra.length === 0 || typeof (tls as any).getCACertificates !== "function") {
-    maxDispatcher = null;
-    return maxDispatcher;
+    dispatchers.set(key, null);
+    return null;
   }
   // The dispatcher's `ca` replaces the per-connection default, so include the
   // standard Mozilla store alongside the Russian national CAs.
-  maxDispatcher = new Agent({
-    connect: { ca: [...(tls as any).getCACertificates("default"), ...extra] },
-  });
+  const ca = [...(tls as any).getCACertificates("default"), ...extra];
+  // Through a proxy the TLS session to MAX is established inside the tunnel,
+  // so the CA list goes to `requestTls` (target), not the proxy connection.
+  const dispatcher: Agent | ProxyAgent = key
+    ? new ProxyAgent({ uri: key, requestTls: { ca } })
+    : new Agent({ connect: { ca } });
+  dispatchers.set(key, dispatcher);
   if (!logged) {
     logged = true;
     logger?.info?.(
       `[MAX] Russian Trusted CAs (${extra.length}) loaded for MAX hosts only (process trust store unchanged)`,
     );
   }
-  return maxDispatcher;
+  return dispatcher;
 }
 
 /**
  * fetch wrapper that routes MAX-infrastructure hosts through the CA-enriched
- * dispatcher and everything else through the untouched global fetch. Pass it
- * to the max-bot-api client (`clientOptions.fetch`) and use it for direct
- * calls (uploads, attachment downloads, probes).
+ * dispatcher (optionally via `proxyUrl`) and everything else through the
+ * untouched global fetch. Pass it to the max-bot-api client
+ * (`clientOptions.fetch`) and use it for direct calls (uploads, attachment
+ * downloads, probes).
  */
-export function createMaxScopedFetch(logger?: CertLogger): FetchLike {
+export function createMaxScopedFetch(logger?: CertLogger, proxyUrl?: string): FetchLike {
   return (input: any, init?: any) => {
     let host = "";
     try {
@@ -96,7 +104,7 @@ export function createMaxScopedFetch(logger?: CertLogger): FetchLike {
       // unparsable URL: let the plain fetch surface the error
     }
     if (host && isMaxInfraHost(host)) {
-      const dispatcher = getMaxDispatcher(logger);
+      const dispatcher = getMaxDispatcher(logger, proxyUrl);
       // Global fetch (not undici's own): it serializes the platform FormData/
       // Blob correctly, while still accepting a dispatcher for scoped TLS.
       if (dispatcher) return globalThis.fetch(input, { ...init, dispatcher });

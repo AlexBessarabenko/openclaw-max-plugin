@@ -23,6 +23,9 @@ Tested with OpenClaw **2026.9.2**, MAX Bot API v2 (`platform-api2.max.ru`).
 - ✅ **Voice transcription** — audio messages transcribed by the gateway's media-understanding pipeline (`tools.media.audio`, e.g. Groq Whisper) — no keys or uploads handled by the plugin itself
 - ✅ `bot_started` support — the "Начать" button becomes `/start` (deep-link payload appended)
 - ✅ Typing indicator with keepalive, bot-loop protection, message deduplication
+- ✅ **Streaming replies** — partial model output edits a single draft message in place (`editMessage`), final text replaces it; can be disabled
+- ✅ **Scoped HTTP proxy** — optional per-account proxy for MAX API traffic only, without touching the rest of the gateway
+- ✅ **Agent prompt hints** — the plugin teaches the agent MAX Markdown rules, the 4000-char limit and delivery-target syntax via `agentPrompt`
 
 ## Installation
 
@@ -80,6 +83,8 @@ npm run build
 | `webhookUrl` | Public URL of the `/max/webhook` route. When set, the plugin subscribes via `POST /subscriptions` automatically. When empty — long polling |
 | `webhookSecret` | Optional secret; verified against the `X-Max-Bot-Api-Secret` header |
 | `apiBaseUrl` | API override, default `https://platform-api2.max.ru` |
+| `streaming` | `true` (default) — edit one draft message as the reply streams; `false` — send only the final message |
+| `httpProxy` | Optional HTTP/HTTPS proxy URL (`http://host:port`) for MAX API requests only |
 
 ### Voice transcription
 
@@ -178,10 +183,28 @@ Since **0.3.5** the plugin ships a `messaging` target adapter, so the agent's `m
 tool and `openclaw message send --channel max --to <target>` accept MAX chat ids directly
 (`max:` prefix optional).
 
-**For DMs the target is the dialog chat id (positive), not the user id** — sending to a
-user id fails with `404 Chat not found`. Group/channel ids are negative. The bot's own
-dialog chat id with a user appears in the gateway log on every inbound message
+**DMs:** since **0.4.0** you can address a user directly with `user:<userId>` — the
+plugin then calls `sendMessageToUser`, which resolves the dialog itself
+(`openclaw message send --channel max --to user:8740709 …`). A bare numeric id is still
+treated as a **chat id** (the dialog chat id works too). Group/channel ids are negative.
+The dialog chat id appears in the gateway log on every inbound message
 (`[MAX] inbound: chat=<id> …`).
+
+### Streaming replies
+
+Since **0.4.0**, when the model streams partial output, the plugin sends one draft
+message and keeps editing it in place (throttled, `format: "markdown"`); the final reply
+replaces the draft text. Long final answers are still chunked at 4000 chars — the first
+chunk edits the draft, the rest arrive as follow-up messages. Set
+`channels.max.streaming: false` to restore the old send-once behavior.
+
+### HTTP proxy
+
+`channels.max.httpProxy` (e.g. `http://proxy.local:3128`) routes **only** MAX API
+traffic (bot client, uploads, attachment downloads, probes) through an undici
+`ProxyAgent`; every other plugin and channel keeps direct connections. The Минцифры CA
+bundle stays in effect through the proxy (`CONNECT` + custom `requestTls.ca`). Proxy
+authentication can be embedded in the URL (`http://user:pass@host:port`).
 
 ### Supported message types
 

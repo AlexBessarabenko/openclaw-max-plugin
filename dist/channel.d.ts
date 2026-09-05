@@ -14,10 +14,15 @@ export type ResolvedAccount = {
     webhookUrl: string | undefined;
     webhookSecret: string | undefined;
     apiBaseUrl: string;
+    httpProxy: string | undefined;
 };
 /** Strip routing prefixes ("max:", "max:group:") from a delivery target. */
 export declare function stripMaxTarget(target: string): string;
-/** Normalize a delivery target: "max:123", "max:group:-45", "chat:123", "user:123" → bare id. */
+/**
+ * Normalize a delivery target: "max:123", "max:group:-45", "chat:123" → bare chat id;
+ * "user:123" / "max:user:123" → "user:123" (kind prefix preserved — a user id is
+ * NOT a chat id: sending it via chat_id fails with 404).
+ */
 export declare function normalizeMaxTarget(raw: string): string;
 /**
  * Target adapter for the `message` tool and `openclaw message send --channel max`.
@@ -29,11 +34,13 @@ export declare function normalizeMaxTarget(raw: string): string;
  * messages are processed, but the agent ends with "visible channel turn
  * dispatched with no queued reply payloads" and the user never gets an answer.
  *
- * Note: for direct chats the delivery target is the **dialog chat id**
- * (positive, differs from the user id); sending to a user id fails with
- * `404 Chat not found`.
+ * Note: for direct chats the bare delivery target is the **dialog chat id**
+ * (positive, differs from the user id). To address a user by their MAX user id
+ * directly, use the explicit `user:<id>` form (sent via sendMessageToUser).
  */
 export declare const maxMessaging: ChannelMessagingAdapter;
+/** Scoped fetch for direct calls outside bot init (probes, attachment downloads). */
+export declare function getMaxFetch(): (input: any, init?: any) => Promise<any>;
 type InboundUpdateHandler = (update: any, token: string) => Promise<void>;
 export declare function setMaxUpdateHandler(handler: InboundUpdateHandler): void;
 /**
@@ -57,7 +64,7 @@ type MaxProbe = {
     };
 };
 export declare const maxPlugin: import("openclaw/plugin-sdk/channel-core").ChannelPlugin<ResolvedAccount, MaxProbe, unknown>;
-export declare function initializeBot(token: string, apiBaseUrl?: string): Bot;
+export declare function initializeBot(token: string, apiBaseUrl?: string, httpProxy?: string): Bot;
 export declare function getBot(): Bot | null;
 export {};
 //# sourceMappingURL=channel.d.ts.map
