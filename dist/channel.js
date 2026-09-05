@@ -260,15 +260,26 @@ async function runMaxAccount(ctx) {
         log?.info("[MAX] Long polling started");
         // bot.start() resolves when polling stops; the max-bot-api polling
         // loop also returns silently after transient fetch errors, so supervise it.
-        while (!ctx.abortSignal?.aborted) {
-            await bot.start({ allowedUpdates: ["message_created", "bot_started"] });
-            if (ctx.abortSignal?.aborted)
-                break;
-            log?.warn("[MAX] Long polling exited unexpectedly, restarting in 5s");
-            stopBot();
-            await new Promise((resolve) => setTimeout(resolve, 5000));
-        }
-        log?.info("[MAX] Long polling stopped");
+        // The client never passes an AbortSignal to fetch, so stop() can wait on
+        // the in-flight long poll (~30s): race supervision against abort and let
+        // the loop wind down in the background instead of blocking shutdown.
+        const supervise = (async () => {
+            while (!ctx.abortSignal?.aborted) {
+                await bot.start({ allowedUpdates: ["message_created", "bot_started"] });
+                if (ctx.abortSignal?.aborted)
+                    break;
+                log?.warn("[MAX] Long polling exited unexpectedly, restarting in 5s");
+                stopBot();
+                await new Promise((resolve) => setTimeout(resolve, 5000));
+            }
+            log?.info("[MAX] Long polling stopped");
+        })();
+        supervise.catch((err) => {
+            const message = err?.message ?? String(err);
+            statusSink({ running: false, lastError: message });
+            log?.error(`[MAX] Account loop failed: ${message}`);
+        });
+        await waitUntilAbort(ctx.abortSignal);
     }
     catch (err) {
         const message = err?.message ?? String(err);

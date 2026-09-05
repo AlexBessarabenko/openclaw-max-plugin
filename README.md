@@ -1,7 +1,15 @@
 # OpenClaw MAX Messenger Plugin
 
 Channel plugin connecting OpenClaw to [MAX Messenger](https://max.ru) — Russian messaging platform.
-Tested with OpenClaw **2026.7.1**, MAX Bot API v2 (`platform-api2.max.ru`).
+Tested with OpenClaw **2026.9.1**, MAX Bot API v2 (`platform-api2.max.ru`).
+
+> **OpenClaw ≥ 2026.9 note:** gateway 2026.9.x starts channel accounts inside a
+> short-lived root-work admission context. Long-lived channel work (the polling
+> loop, post-ACK webhook processing) must detach from it, otherwise every
+> inbound dispatch is rejected with `GatewayDrainingError` — messages arrive,
+> but replies are never sent. Since **0.3.4** the plugin detaches automatically
+> (`runOutsideInheritedRootWork` in `channel.ts`). On plugin ≤ 0.3.3 replies
+> silently stop after a gateway restart.
 
 ## Features
 
@@ -203,6 +211,13 @@ npm run build  # build to dist/
 - Check the token (`GET /me` is verified at startup in webhook mode)
 - Without `webhookUrl` the plugin uses polling — make sure no webhook is stuck in MAX (delete it in bot settings)
 - With `dmPolicy: "allowlist"`, add your MAX user ID to `allowFrom`
+
+### Messages arrive but no replies (`GatewayDrainingError`)
+- Symptom: gateway logs show `[MAX] inbound: …` followed by
+  `Gateway is draining; new tasks are not accepted`. This is the OpenClaw ≥ 2026.9
+  root-work admission issue described at the top of this README — update the plugin
+  to ≥ 0.3.4.
+- `openclaw channels status` should show `MAX Messenger default: enabled, configured, running, connected`; if it shows `not-running`, update to ≥ 0.3.4 (earlier versions never reported channel status).
 
 ### TLS errors to platform-api2.max.ru
 - Update to plugin ≥ 0.2.0 (bundles the Минцифры CAs) or install them system-wide (see above)
