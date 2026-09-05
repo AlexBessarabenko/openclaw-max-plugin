@@ -116,19 +116,18 @@ additionally consent-gated and locale-configurable.
 MAX officially requires bots to migrate to `platform-api2.max.ru` and to trust the
 Russian national root CA (Минцифры / "Russian Trusted Root CA", distributed via
 [gosuslugi.ru/crt](https://www.gosuslugi.ru/crt)). Node.js does not trust this root
-out of the box, so the plugin ships the required PEM files in `certs/` and installs
-them at startup via `tls.setDefaultCACertificates` (Node ≥ 22.15) — no manual steps
-needed.
+out of the box, so the plugin ships the required PEM files in `certs/`.
 
-**Scope note:** this extends the TLS trust store of the **entire Node.js process** —
-every outbound TLS connection from the gateway will trust this root, not only calls
-to the MAX API. This is intentional (it matches the official MAX requirement) and is
-what the ClawHub security audit highlights. On a dedicated OpenClaw gateway/container
-(the recommended deployment) the trust scope is equivalent to installing the CA into
-that host's system store.
+Since **0.3.6** the extra CAs are loaded into a dedicated undici dispatcher used
+**only for requests to MAX infrastructure hosts** (`*.max.ru`, `*.oneme.ru`) — the
+plugin passes a scoped `fetch` to the max-bot-api client and uses it for uploads,
+attachment downloads and probes. The process-wide TLS trust store is **never
+modified** (`tls.setDefaultCACertificates` is not called): every other plugin and
+channel in the gateway keeps Node's default trust. This addresses the ClawHub
+security-audit note from earlier versions.
 
-On Node older than 22.15 the plugin cannot extend the trust store at runtime and
-warns instead — install the certificates system-wide:
+On Node older than 22.15 the plugin cannot read the default CA list at runtime
+and warns instead — install the certificates system-wide:
 
 ```bash
 sudo cp certs/*.crt /usr/local/share/ca-certificates/mincifry/

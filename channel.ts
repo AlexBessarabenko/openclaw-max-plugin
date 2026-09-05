@@ -6,7 +6,7 @@ import type { ChannelMessagingAdapter } from "openclaw/plugin-sdk/core";
 import { buildProbeChannelStatusSummary } from "openclaw/plugin-sdk/channel-status";
 import { createComputedAccountStatusAdapter, createDefaultChannelRuntimeState } from "openclaw/plugin-sdk/status-helpers";
 import { Bot } from "@maxhub/max-bot-api";
-import { ensureRussianTrustedCAs } from "./certs.js";
+import { createMaxScopedFetch } from "./certs.js";
 
 export const MAX_CHANNEL_ID = "max";
 export const DEFAULT_ACCOUNT_ID = "default";
@@ -136,7 +136,7 @@ async function rawUploadMaxMedia(
   const { url, token } = await (bot.api as any).raw.uploads.getUploadUrl({ type });
   const form = new FormData();
   form.append("data", new Blob([data]), filename);
-  const res = await fetch(url, { method: "POST", body: form });
+  const res = await maxFetch(url, { method: "POST", body: form });
   if (!res.ok) throw new Error(`media upload failed: HTTP ${res.status}`);
   const json = (await res.json().catch(() => ({}))) as Record<string, any>;
   if (type === "image" && json.photos && typeof json.photos === "object") {
@@ -155,6 +155,9 @@ function extractSentMessageId(sent: any): string {
 
 // Store bot instance for outbound messaging
 let botInstance: Bot | null = null;
+
+/** fetch that trusts the bundled Russian national CAs on MAX hosts only. */
+const maxFetch = createMaxScopedFetch();
 
 // Inbound updates are processed by the handler registered from the plugin
 // entry (index.ts), where the full plugin api is available.
@@ -194,7 +197,7 @@ type MaxProbe = {
 async function probeMaxAccount(account: ResolvedAccount, timeoutMs: number): Promise<MaxProbe> {
   if (!account.token) return { ok: false, error: "token is not configured" };
   try {
-    const resp = await fetch(`${account.apiBaseUrl}/me`, {
+    const resp = await maxFetch(`${account.apiBaseUrl}/me`, {
       headers: { Authorization: account.token },
       signal: AbortSignal.timeout(timeoutMs),
     });
@@ -357,7 +360,12 @@ export function initializeBot(token: string, apiBaseUrl?: string): Bot {
     }
   }
   botInstance = new Bot(token, {
-    clientOptions: { baseUrl: apiBaseUrl ?? DEFAULT_API_BASE_URL },
+    clientOptions: {
+      baseUrl: apiBaseUrl ?? DEFAULT_API_BASE_URL,
+      // Scoped TLS: Russian national CAs apply to MAX hosts only; the
+      // process-wide trust store is never touched.
+      fetch: maxFetch as any,
+    },
   });
   return botInstance;
 }
@@ -377,9 +385,6 @@ function ensureBotForOutbound(cfg: OpenClawConfig): Bot {
   if (botInstance) return botInstance;
   const account = resolveAccount(cfg, DEFAULT_ACCOUNT_ID);
   if (!account.token) throw new Error("MAX token is not configured");
-  // registerFull (which installs the Минцифры CA bundle) does not run on the
-  // bare outbound path — make sure TLS to platform-api2.max.ru verifies.
-  ensureRussianTrustedCAs();
   return initializeBot(account.token, account.apiBaseUrl);
 }
 
@@ -410,7 +415,7 @@ async function runMaxAccount(ctx: ChannelGatewayContext<ResolvedAccount>): Promi
   if (account.webhookUrl) {
     try {
       await bot.api.getMyInfo();
-      const resp = await fetch(`${account.apiBaseUrl}/subscriptions`, {
+      const resp = await maxFetch(`${account.apiBaseUrl}/subscriptions`, {
         method: "POST",
         headers: { "content-type": "application/json", Authorization: account.token },
         body: JSON.stringify({

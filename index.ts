@@ -2,7 +2,7 @@ import { timingSafeEqual } from "node:crypto";
 import { defineChannelPluginEntry } from "openclaw/plugin-sdk/channel-core";
 import { createTypingCallbacks } from "openclaw/plugin-sdk/channel-reply-pipeline";
 import { getBot, maxPlugin, runOutsideInheritedRootWork, setMaxUpdateHandler, DEFAULT_ACCOUNT_ID, MAX_CHANNEL_ID } from "./channel.js";
-import { ensureRussianTrustedCAs } from "./certs.js";
+import { createMaxScopedFetch } from "./certs.js";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk/channel-core";
 
 /** MAX caps message text at 4000 chars. */
@@ -142,10 +142,12 @@ function attachmentNeedsAuth(url: string): boolean {
   }
 }
 
+const maxFetch = createMaxScopedFetch();
+
 async function downloadAttachment(url: string, token?: string): Promise<Buffer> {
   const headers =
     token && attachmentNeedsAuth(url) ? { Authorization: `Bearer ${token}` } : undefined;
-  const resp = await fetch(url, headers ? { headers } : undefined);
+  const resp = await maxFetch(url, headers ? { headers } : undefined);
   if (!resp.ok) throw new Error(`download failed: HTTP ${resp.status}`);
   return Buffer.from(await resp.arrayBuffer());
 }
@@ -440,8 +442,6 @@ export default defineChannelPluginEntry({
     );
   },
   async registerFull(api: OpenClawPluginApi) {
-    ensureRussianTrustedCAs(api.logger);
-
     const cfg = api.config as any;
     const section = cfg?.channels?.[MAX_CHANNEL_ID];
     const token = section?.token as string | undefined;

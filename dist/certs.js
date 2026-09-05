@@ -2,11 +2,17 @@ import { existsSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import tls from "node:tls";
 import { fileURLToPath } from "node:url";
+import { Agent } from "undici";
 /**
  * MAX API (platform-api2.max.ru) is served with a certificate chained to the
  * Russian national root CA ("Russian Trusted Root CA" / Минцифры), which is
- * absent from Node's bundled CA list. The PEM files are shipped in `certs/`
- * (also installable system-wide into /usr/local/share/ca-certificates/mincifry).
+ * absent from Node's bundled CA list. The PEM files are shipped in `certs/`.
+ *
+ * Instead of expanding the process-wide trust store
+ * (tls.setDefaultCACertificates affects every plugin and channel in the
+ * gateway), the extra CAs live on a dedicated undici dispatcher used ONLY for
+ * requests to MAX infrastructure hosts (*.max.ru, *.oneme.ru). All other
+ * traffic keeps Node's default trust.
  */
 const CERT_FILES = [
     "russian_trusted_root_ca_pem.crt",
@@ -14,45 +20,77 @@ const CERT_FILES = [
     "russian_trusted_sub_ca_2024_pem.crt",
 ];
 const FALLBACK_DIR = "/usr/local/share/ca-certificates/mincifry";
-let installed = false;
-export function ensureRussianTrustedCAs(logger) {
-    if (installed)
-        return;
-    installed = true;
-    if (typeof tls.setDefaultCACertificates !== "function" ||
-        typeof tls.getCACertificates !== "function") {
-        logger?.warn?.("[MAX] This Node.js version cannot extend CAs at runtime. " +
-            "Restart with NODE_EXTRA_CA_CERTS pointing at certs/russian_trusted_root_ca_pem.crt");
-        return;
-    }
+/** Hosts whose certificate chains require the bundled Russian national CAs. */
+const MAX_HOST_RE = /(^|\.)(max|oneme)\.ru$/i;
+export function isMaxInfraHost(hostname) {
+    return MAX_HOST_RE.test(hostname);
+}
+let maxDispatcher;
+let logged = false;
+function loadExtraCAs(logger) {
     const pluginRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
     const candidates = [join(pluginRoot, "certs"), FALLBACK_DIR];
-    const extra = [];
     for (const dir of candidates) {
+        const pem = [];
         for (const file of CERT_FILES) {
             const path = join(dir, file);
             if (!existsSync(path))
                 continue;
             try {
-                extra.push(readFileSync(path, "utf8"));
+                pem.push(readFileSync(path, "utf8"));
             }
             catch {
                 // try next directory
             }
         }
-        if (extra.length > 0)
-            break;
+        if (pem.length > 0)
+            return pem;
     }
-    if (extra.length === 0) {
-        logger?.warn?.("[MAX] Russian Trusted CA certificates not found; TLS to platform-api2.max.ru may fail");
-        return;
+    logger?.warn?.("[MAX] Russian Trusted CA certificates not found; TLS to platform-api2.max.ru may fail");
+    return [];
+}
+function getMaxDispatcher(logger) {
+    if (maxDispatcher !== undefined)
+        return maxDispatcher;
+    const extra = loadExtraCAs(logger);
+    if (extra.length === 0 || typeof tls.getCACertificates !== "function") {
+        maxDispatcher = null;
+        return maxDispatcher;
     }
-    try {
-        tls.setDefaultCACertificates([...tls.getCACertificates("default"), ...extra]);
-        logger?.info?.(`[MAX] Russian Trusted CA bundle installed (${extra.length} certificates)`);
+    // The dispatcher's `ca` replaces the per-connection default, so include the
+    // standard Mozilla store alongside the Russian national CAs.
+    maxDispatcher = new Agent({
+        connect: { ca: [...tls.getCACertificates("default"), ...extra] },
+    });
+    if (!logged) {
+        logged = true;
+        logger?.info?.(`[MAX] Russian Trusted CAs (${extra.length}) loaded for MAX hosts only (process trust store unchanged)`);
     }
-    catch (err) {
-        logger?.warn?.(`[MAX] Failed to install Russian Trusted CAs: ${err.message}`);
-    }
+    return maxDispatcher;
+}
+/**
+ * fetch wrapper that routes MAX-infrastructure hosts through the CA-enriched
+ * dispatcher and everything else through the untouched global fetch. Pass it
+ * to the max-bot-api client (`clientOptions.fetch`) and use it for direct
+ * calls (uploads, attachment downloads, probes).
+ */
+export function createMaxScopedFetch(logger) {
+    return (input, init) => {
+        let host = "";
+        try {
+            host = new URL(typeof input === "string" ? input : (input?.url ?? String(input))).hostname;
+        }
+        catch {
+            // unparsable URL: let the plain fetch surface the error
+        }
+        if (host && isMaxInfraHost(host)) {
+            const dispatcher = getMaxDispatcher(logger);
+            // Global fetch (not undici's own): it serializes the platform FormData/
+            // Blob correctly, while still accepting a dispatcher for scoped TLS.
+            if (dispatcher)
+                return globalThis.fetch(input, { ...init, dispatcher });
+        }
+        return globalThis.fetch(input, init);
+    };
 }
 //# sourceMappingURL=certs.js.map

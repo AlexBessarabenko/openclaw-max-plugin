@@ -2,7 +2,7 @@ import { timingSafeEqual } from "node:crypto";
 import { defineChannelPluginEntry } from "openclaw/plugin-sdk/channel-core";
 import { createTypingCallbacks } from "openclaw/plugin-sdk/channel-reply-pipeline";
 import { getBot, maxPlugin, runOutsideInheritedRootWork, setMaxUpdateHandler, DEFAULT_ACCOUNT_ID, MAX_CHANNEL_ID } from "./channel.js";
-import { ensureRussianTrustedCAs } from "./certs.js";
+import { createMaxScopedFetch } from "./certs.js";
 /** MAX caps message text at 4000 chars. */
 const MAX_TEXT_LIMIT = 4000;
 // Deduplication: messageId → timestamp (TTL 5 min)
@@ -123,9 +123,10 @@ function attachmentNeedsAuth(url) {
         return false;
     }
 }
+const maxFetch = createMaxScopedFetch();
 async function downloadAttachment(url, token) {
     const headers = token && attachmentNeedsAuth(url) ? { Authorization: `Bearer ${token}` } : undefined;
-    const resp = await fetch(url, headers ? { headers } : undefined);
+    const resp = await maxFetch(url, headers ? { headers } : undefined);
     if (!resp.ok)
         throw new Error(`download failed: HTTP ${resp.status}`);
     return Buffer.from(await resp.arrayBuffer());
@@ -381,7 +382,6 @@ export default defineChannelPluginEntry({
         });
     },
     async registerFull(api) {
-        ensureRussianTrustedCAs(api.logger);
         const cfg = api.config;
         const section = cfg?.channels?.[MAX_CHANNEL_ID];
         const token = section?.token;

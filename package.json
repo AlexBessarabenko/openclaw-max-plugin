@@ -1,6 +1,6 @@
 {
   "name": "@alexbessarabenko/openclaw-max",
-  "version": "0.3.5",
+  "version": "0.3.6",
   "description": "MAX messenger channel plugin for OpenClaw",
   "license": "MIT",
   "type": "module",
@@ -11,7 +11,8 @@
     "dev": "tsc --watch"
   },
   "dependencies": {
-    "@maxhub/max-bot-api": "^0.3.1"
+    "@maxhub/max-bot-api": "^0.3.1",
+    "undici": "^7.29.1"
   },
   "devDependencies": {
     "@types/node": "^22.5.5",
