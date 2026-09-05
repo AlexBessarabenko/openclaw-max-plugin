@@ -1,7 +1,8 @@
 import { createChatChannelPlugin } from "openclaw/plugin-sdk/channel-core";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/channel-core";
 import { createAccountStatusSink, waitUntilAbort } from "openclaw/plugin-sdk/channel-lifecycle";
-import type { ChannelGatewayContext, ChannelMessagingAdapter } from "openclaw/plugin-sdk/channel-runtime";
+import type { ChannelGatewayContext } from "openclaw/plugin-sdk/channel-contract";
+import type { ChannelMessagingAdapter } from "openclaw/plugin-sdk/core";
 import { buildProbeChannelStatusSummary } from "openclaw/plugin-sdk/channel-status";
 import { createComputedAccountStatusAdapter, createDefaultChannelRuntimeState } from "openclaw/plugin-sdk/status-helpers";
 import { Bot } from "@maxhub/max-bot-api";
@@ -350,7 +351,7 @@ export const maxPlugin = createChatChannelPlugin<ResolvedAccount, MaxProbe>({
 export function initializeBot(token: string, apiBaseUrl?: string): Bot {
   if (botInstance) {
     try {
-      botInstance.stop();
+      botInstance.stopPolling();
     } catch {
       // previous instance was not polling
     }
@@ -370,7 +371,7 @@ export function getBot(): Bot | null {
  * Outbound sends also run outside the gateway lifecycle (e.g. the
  * `openclaw message send` CLI loads the plugin in-process), where
  * `initializeBot` was never called. Fall back to a send-only client built
- * from the configured token; `Bot` only starts polling on `.start()`.
+ * from the configured token; `Bot` only starts polling on `.startPolling()`.
  */
 function ensureBotForOutbound(cfg: OpenClawConfig): Bot {
   if (botInstance) return botInstance;
@@ -430,7 +431,7 @@ async function runMaxAccount(ctx: ChannelGatewayContext<ResolvedAccount>): Promi
 
   const stopBot = () => {
     try {
-      bot.stop();
+      bot.stopPolling();
     } catch {
       // bot was not polling
     }
@@ -465,13 +466,19 @@ async function runMaxAccount(ctx: ChannelGatewayContext<ResolvedAccount>): Promi
     });
 
     log?.info("[MAX] Long polling started");
-    // bot.start() resolves when polling stops; the max-bot-api polling
-    // loop also returns silently after transient fetch errors, so supervise it.
-    // The client never passes an AbortSignal to fetch, so stop() can wait on
-    // the in-flight long poll (~30s): race supervision against abort and let
-    // the loop wind down in the background instead of blocking shutdown.
-    // Restarts use exponential backoff with jitter (5s → 5min) so a MAX-side
-    // outage is not hammered; a healthy run > 60s resets the delay.
+    // max-bot-api 0.3.1 reads bot.botInfo.username in startPolling but only
+    // populates botInfo in the legacy start() flow — fetch it explicitly,
+    // otherwise polling dies instantly on a TypeError and retries forever.
+    try {
+      bot.botInfo = await bot.api.getMyInfo();
+    } catch (err: any) {
+      log?.warn(`[MAX] getMyInfo failed before polling: ${err?.message ?? err}`);
+    }
+    // bot.startPolling() resolves when polling stops. max-bot-api ≥ 0.3.1
+    // retries transient errors internally and honors AbortSignal; the
+    // supervisor stays as a safety net for silent exits. Restarts use
+    // exponential backoff with jitter (5s → 5min) so a MAX-side outage is
+    // not hammered; a healthy run > 60s resets the delay.
     const MIN_RESTART_DELAY_MS = 5000;
     const MAX_RESTART_DELAY_MS = 5 * 60 * 1000;
     const HEALTHY_RUN_MS = 60000;
@@ -479,7 +486,7 @@ async function runMaxAccount(ctx: ChannelGatewayContext<ResolvedAccount>): Promi
     const supervise = (async () => {
       while (!ctx.abortSignal?.aborted) {
         const startedAt = Date.now();
-        await bot.start({ allowedUpdates: ["message_created", "bot_started"] });
+        await bot.startPolling({ allowedUpdates: ["message_created", "bot_started"] });
         if (ctx.abortSignal?.aborted) break;
         if (Date.now() - startedAt > HEALTHY_RUN_MS) restartDelayMs = MIN_RESTART_DELAY_MS;
         const waitMs = Math.round(restartDelayMs * (0.5 + Math.random()));

@@ -1,4 +1,4 @@
-import type { ChannelMessagingAdapter } from "openclaw/plugin-sdk/channel-runtime";
+import type { ChannelMessagingAdapter } from "openclaw/plugin-sdk/core";
 import { Bot } from "@maxhub/max-bot-api";
 export declare const MAX_CHANNEL_ID = "max";
 export declare const DEFAULT_ACCOUNT_ID = "default";
