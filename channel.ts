@@ -77,7 +77,6 @@ export function normalizeMaxTarget(raw: string): string {
  * (e.g. `deliveryDefaults.sourceVisibleReplies = "message_tool"`): inbound
  * messages are processed, but the agent ends with "visible channel turn
  * dispatched with no queued reply payloads" and the user never gets an answer.
-<<<<<<< HEAD
  *
  * Note: for direct chats the delivery target is the **dialog chat id**
  * (positive, differs from the user id); sending to a user id fails with
@@ -95,36 +94,18 @@ export const maxMessaging: ChannelMessagingAdapter = {
     looksLikeId: (raw, normalized) => MAX_TARGET_ID_RE.test(normalizeMaxTarget(normalized ?? raw)),
     hint: "<chat_id> (MAX chat id: positive = dialog, negative = group/channel; not the user id)",
     resolveTarget: async ({ normalized, input }) => {
-=======
- */
-export const maxMessaging = {
-  targetPrefixes: ["max"],
-  normalizeTarget: (raw: string): string | undefined => normalizeMaxTarget(raw) || undefined,
-  targetResolver: {
-    looksLikeId: (raw: string, normalized?: string): boolean =>
-      MAX_TARGET_ID_RE.test(normalizeMaxTarget(normalized ?? raw)),
-    hint: "<chat_id> (MAX chat id: positive = dialog, negative = group/channel; not the user id)",
-    resolveTarget: async ({ normalized, input }: { normalized: string; input: string }) => {
->>>>>>> pr-2
       const to = normalizeMaxTarget(normalized ?? input);
       if (!MAX_TARGET_ID_RE.test(to)) return null;
       return {
         to,
-<<<<<<< HEAD
         kind: to.startsWith("-") ? "group" : "user",
         display: to,
         source: "normalized",
-=======
-        kind: (to.startsWith("-") ? "group" : "user") as "group" | "user",
-        display: to,
-        source: "normalized" as const,
->>>>>>> pr-2
       };
     },
   },
 };
 
-<<<<<<< HEAD
 type MaxUploadType = "image" | "video" | "audio" | "file";
 
 const IMAGE_EXTS = new Set(["png", "jpg", "jpeg", "gif", "webp"]);
@@ -172,8 +153,6 @@ function extractSentMessageId(sent: any): string {
   return mid != null ? String(mid) : String(Date.now());
 }
 
-=======
->>>>>>> pr-2
 // Store bot instance for outbound messaging
 let botInstance: Bot | null = null;
 
