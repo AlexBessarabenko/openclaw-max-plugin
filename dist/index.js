@@ -1,7 +1,7 @@
 import { timingSafeEqual } from "node:crypto";
 import { defineChannelPluginEntry } from "openclaw/plugin-sdk/channel-core";
 import { createTypingCallbacks } from "openclaw/plugin-sdk/channel-reply-pipeline";
-import { getBot, maxPlugin, setMaxUpdateHandler, DEFAULT_ACCOUNT_ID, MAX_CHANNEL_ID } from "./channel.js";
+import { getBot, maxPlugin, runOutsideInheritedRootWork, setMaxUpdateHandler, DEFAULT_ACCOUNT_ID, MAX_CHANNEL_ID } from "./channel.js";
 import { ensureRussianTrustedCAs } from "./certs.js";
 /** MAX caps message text at 4000 chars. */
 const MAX_TEXT_LIMIT = 4000;
@@ -418,10 +418,12 @@ export default defineChannelPluginEntry({
                         req.on("error", reject);
                     });
                     const update = JSON.parse(body);
-                    // MAX requires a timely HTTP 200; process after ACK
+                    // MAX requires a timely HTTP 200; process after ACK. The request's
+                    // root-work admission ends with the response, so detach the async
+                    // processing from that context (see runOutsideInheritedRootWork).
                     res.statusCode = 200;
                     res.end("ok");
-                    handleUpdate(api, update, token).catch((err) => api.logger.error("[MAX] update handling failed: " + (err?.message ?? err)));
+                    runOutsideInheritedRootWork(() => handleUpdate(api, update, token).catch((err) => api.logger.error("[MAX] update handling failed: " + (err?.message ?? err))));
                     return true;
                 }
                 catch (err) {

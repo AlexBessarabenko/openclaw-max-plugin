@@ -1,6 +1,7 @@
 import { createChatChannelPlugin } from "openclaw/plugin-sdk/channel-core";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/channel-core";
 import { createAccountStatusSink, waitUntilAbort } from "openclaw/plugin-sdk/channel-lifecycle";
+import type { ChannelGatewayContext } from "openclaw/plugin-sdk/channel-runtime";
 import { buildProbeChannelStatusSummary } from "openclaw/plugin-sdk/channel-status";
 import { createComputedAccountStatusAdapter, createDefaultChannelRuntimeState } from "openclaw/plugin-sdk/status-helpers";
 import { Bot } from "@maxhub/max-bot-api";
@@ -63,6 +64,26 @@ let updateHandler: InboundUpdateHandler | null = null;
 
 export function setMaxUpdateHandler(handler: InboundUpdateHandler): void {
   updateHandler = handler;
+}
+
+/**
+ * Run `run` detached from any inherited gateway root-work admission context.
+ *
+ * The gateway may invoke channel startup inside a short-lived "root work"
+ * admission (e.g. the restart-startup handshake). Long-lived work started from
+ * there — the polling loop, post-ACK webhook processing — keeps that
+ * AsyncLocalStorage context, and once the admission is released every
+ * downstream dispatch is rejected with GatewayDrainingError. The admission
+ * state lives in a process-wide singleton; exiting the ALS store makes the
+ * work independent of the caller's admission lifetime.
+ */
+export function runOutsideInheritedRootWork<T>(run: () => T): T {
+  const state = (globalThis as any)[Symbol.for("openclaw.gatewayWorkAdmissionState")];
+  const store = state?.currentRootWork;
+  if (store && typeof store.exit === "function" && store.getStore?.()) {
+    return store.exit(run);
+  }
+  return run();
 }
 
 type MaxProbe = {
@@ -132,110 +153,8 @@ export const maxPlugin = createChatChannelPlugin<ResolvedAccount, MaxProbe>({
       }),
     }),
     gateway: {
-      startAccount: async (ctx) => {
-        const account = ctx.account;
-        const log = ctx.log;
-        const statusSink = createAccountStatusSink({
-          accountId: ctx.accountId,
-          setStatus: ctx.setStatus,
-        });
-
-        if (!account.token) {
-          log?.warn("[MAX] No token configured, account not started");
-          statusSink({ running: false, lastError: "token is not configured" });
-          return;
-        }
-        if (!updateHandler) {
-          log?.error("[MAX] Inbound update handler not registered, account not started");
-          statusSink({ running: false, lastError: "plugin entry not fully registered" });
-          return;
-        }
-        const handler = updateHandler;
-
-        const bot = initializeBot(account.token, account.apiBaseUrl);
-        statusSink({ running: true, lastStartAt: Date.now(), lastError: null });
-
-        let webhookActive = false;
-        if (account.webhookUrl) {
-          try {
-            await bot.api.getMyInfo();
-            const resp = await fetch(`${account.apiBaseUrl}/subscriptions`, {
-              method: "POST",
-              headers: { "content-type": "application/json", Authorization: account.token },
-              body: JSON.stringify({
-                url: account.webhookUrl,
-                update_types: ["message_created", "bot_started"],
-                ...(account.webhookSecret ? { secret: account.webhookSecret } : {}),
-              }),
-            });
-            if (!resp.ok) {
-              throw new Error(`POST /subscriptions failed: HTTP ${resp.status} ${await resp.text()}`);
-            }
-            webhookActive = true;
-            log?.info(`[MAX] Webhook subscribed: ${account.webhookUrl}`);
-          } catch (err: any) {
-            log?.warn(`[MAX] Webhook subscription failed, falling back to polling: ${err?.message ?? err}`);
-          }
-        }
-
-        const stopBot = () => {
-          try {
-            bot.stop();
-          } catch {
-            // bot was not polling
-          }
-        };
-        ctx.abortSignal?.addEventListener("abort", stopBot, { once: true });
-
-        try {
-          if (webhookActive) {
-            await waitUntilAbort(ctx.abortSignal);
-            return;
-          }
-
-          bot.catch((err: any) => {
-            log?.error(`[MAX] Bot middleware error: ${err?.message ?? err}`);
-          });
-          bot.on("message_created", async (botCtx: any) => {
-            try {
-              await handler(
-                botCtx.update ?? { update_type: "message_created", message: botCtx.message },
-                account.token,
-              );
-            } catch (err: any) {
-              log?.error("[MAX] polling update failed: " + (err?.message ?? err));
-            }
-          });
-          bot.on("bot_started", async (botCtx: any) => {
-            try {
-              await handler(botCtx.update ?? botCtx, account.token);
-            } catch (err: any) {
-              log?.error("[MAX] bot_started handling failed: " + (err?.message ?? err));
-            }
-          });
-
-          log?.info("[MAX] Long polling started");
-          // bot.start() resolves when polling stops; the max-bot-api polling
-          // loop also returns silently after transient fetch errors, so supervise it.
-          while (!ctx.abortSignal?.aborted) {
-            await bot.start({ allowedUpdates: ["message_created", "bot_started"] });
-            if (ctx.abortSignal?.aborted) break;
-            log?.warn("[MAX] Long polling exited unexpectedly, restarting in 5s");
-            stopBot();
-            await new Promise((resolve) => setTimeout(resolve, 5000));
-          }
-          log?.info("[MAX] Long polling stopped");
-        } catch (err: any) {
-          const message = err?.message ?? String(err);
-          statusSink({ running: false, lastError: message });
-          log?.error(`[MAX] Account loop failed: ${message}`);
-          throw err;
-        } finally {
-          ctx.abortSignal?.removeEventListener("abort", stopBot);
-          stopBot();
-          statusSink({ running: false, lastStopAt: Date.now() });
-        }
-      },
+      startAccount: async (ctx) =>
+        runOutsideInheritedRootWork(() => runMaxAccount(ctx)),
     },
   },
 
@@ -318,4 +237,109 @@ export function initializeBot(token: string, apiBaseUrl?: string): Bot {
 // Get current bot instance
 export function getBot(): Bot | null {
   return botInstance;
+}
+
+async function runMaxAccount(ctx: ChannelGatewayContext<ResolvedAccount>): Promise<void> {
+  const account = ctx.account;
+  const log = ctx.log;
+  const statusSink = createAccountStatusSink({
+    accountId: ctx.accountId,
+    setStatus: ctx.setStatus,
+  });
+
+  if (!account.token) {
+    log?.warn("[MAX] No token configured, account not started");
+    statusSink({ running: false, lastError: "token is not configured" });
+    return;
+  }
+  if (!updateHandler) {
+    log?.error("[MAX] Inbound update handler not registered, account not started");
+    statusSink({ running: false, lastError: "plugin entry not fully registered" });
+    return;
+  }
+  const handler = updateHandler;
+
+  const bot = initializeBot(account.token, account.apiBaseUrl);
+  statusSink({ running: true, lastStartAt: Date.now(), lastError: null });
+
+  let webhookActive = false;
+  if (account.webhookUrl) {
+    try {
+      await bot.api.getMyInfo();
+      const resp = await fetch(`${account.apiBaseUrl}/subscriptions`, {
+        method: "POST",
+        headers: { "content-type": "application/json", Authorization: account.token },
+        body: JSON.stringify({
+          url: account.webhookUrl,
+          update_types: ["message_created", "bot_started"],
+          ...(account.webhookSecret ? { secret: account.webhookSecret } : {}),
+        }),
+      });
+      if (!resp.ok) {
+        throw new Error(`POST /subscriptions failed: HTTP ${resp.status} ${await resp.text()}`);
+      }
+      webhookActive = true;
+      log?.info(`[MAX] Webhook subscribed: ${account.webhookUrl}`);
+    } catch (err: any) {
+      log?.warn(`[MAX] Webhook subscription failed, falling back to polling: ${err?.message ?? err}`);
+    }
+  }
+
+  const stopBot = () => {
+    try {
+      bot.stop();
+    } catch {
+      // bot was not polling
+    }
+  };
+  ctx.abortSignal?.addEventListener("abort", stopBot, { once: true });
+
+  try {
+    if (webhookActive) {
+      await waitUntilAbort(ctx.abortSignal);
+      return;
+    }
+
+    bot.catch((err: any) => {
+      log?.error(`[MAX] Bot middleware error: ${err?.message ?? err}`);
+    });
+    bot.on("message_created", async (botCtx: any) => {
+      try {
+        await handler(
+          botCtx.update ?? { update_type: "message_created", message: botCtx.message },
+          account.token,
+        );
+      } catch (err: any) {
+        log?.error("[MAX] polling update failed: " + (err?.message ?? err));
+      }
+    });
+    bot.on("bot_started", async (botCtx: any) => {
+      try {
+        await handler(botCtx.update ?? botCtx, account.token);
+      } catch (err: any) {
+        log?.error("[MAX] bot_started handling failed: " + (err?.message ?? err));
+      }
+    });
+
+    log?.info("[MAX] Long polling started");
+    // bot.start() resolves when polling stops; the max-bot-api polling
+    // loop also returns silently after transient fetch errors, so supervise it.
+    while (!ctx.abortSignal?.aborted) {
+      await bot.start({ allowedUpdates: ["message_created", "bot_started"] });
+      if (ctx.abortSignal?.aborted) break;
+      log?.warn("[MAX] Long polling exited unexpectedly, restarting in 5s");
+      stopBot();
+      await new Promise((resolve) => setTimeout(resolve, 5000));
+    }
+    log?.info("[MAX] Long polling stopped");
+  } catch (err: any) {
+    const message = err?.message ?? String(err);
+    statusSink({ running: false, lastError: message });
+    log?.error(`[MAX] Account loop failed: ${message}`);
+    throw err;
+  } finally {
+    ctx.abortSignal?.removeEventListener("abort", stopBot);
+    stopBot();
+    statusSink({ running: false, lastStopAt: Date.now() });
+  }
 }

@@ -18,6 +18,18 @@ export type ResolvedAccount = {
 export declare function stripMaxTarget(target: string): string;
 type InboundUpdateHandler = (update: any, token: string) => Promise<void>;
 export declare function setMaxUpdateHandler(handler: InboundUpdateHandler): void;
+/**
+ * Run `run` detached from any inherited gateway root-work admission context.
+ *
+ * The gateway may invoke channel startup inside a short-lived "root work"
+ * admission (e.g. the restart-startup handshake). Long-lived work started from
+ * there — the polling loop, post-ACK webhook processing — keeps that
+ * AsyncLocalStorage context, and once the admission is released every
+ * downstream dispatch is rejected with GatewayDrainingError. The admission
+ * state lives in a process-wide singleton; exiting the ALS store makes the
+ * work independent of the caller's admission lifetime.
+ */
+export declare function runOutsideInheritedRootWork<T>(run: () => T): T;
 type MaxProbe = {
     ok: boolean;
     error?: string;
