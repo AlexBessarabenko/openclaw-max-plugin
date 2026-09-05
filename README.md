@@ -169,7 +169,20 @@ Set `webhookUrl` to the public address of your gateway's `/max/webhook` route �
 
 ### Long polling
 
-Leave `webhookUrl` empty — the plugin polls `GET /updates` automatically.
+Leave `webhookUrl` empty — the plugin polls `GET /updates` automatically. Restarts after
+transient errors use exponential backoff with jitter (5 s → 5 min, reset after a healthy
+minute) and are logged as `Long polling exited unexpectedly, restarting in Ns`.
+
+### Delivery targets (`message` tool, `openclaw message send`)
+
+Since **0.3.5** the plugin ships a `messaging` target adapter, so the agent's `message`
+tool and `openclaw message send --channel max --to <target>` accept MAX chat ids directly
+(`max:` prefix optional).
+
+**For DMs the target is the dialog chat id (positive), not the user id** — sending to a
+user id fails with `404 Chat not found`. Group/channel ids are negative. The bot's own
+dialog chat id with a user appears in the gateway log on every inbound message
+(`[MAX] inbound: chat=<id> …`).
 
 ### Supported message types
 
@@ -184,6 +197,14 @@ Leave `webhookUrl` empty — the plugin polls `GET /updates` automatically.
 | Forwarded | ✅ | — | Content unwrapped from `link.message`, marked `[Forwarded from …]`; media processed as usual |
 | Replies | ✅ | — | Quoted original shown as `[Reply to …: "…"]` (≤200 chars) |
 | Group chats | ✅ | ✅ | Per-chat sessions |
+
+### Outgoing media
+
+Since **0.3.5** the plugin implements the `sendMedia` outbound adapter: the agent's
+`message` tool can attach images, video, audio and files from a URL or a local path
+(subject to the gateway's outbound-media access rules). Uploads go through the raw
+`POST /uploads` endpoint because max-bot-api 0.2.5 drops the upload token on the
+Buffer code path.
 
 ### Multimodal models (images & PDFs)
 

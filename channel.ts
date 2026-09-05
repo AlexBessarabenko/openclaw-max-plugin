@@ -1,10 +1,11 @@
 import { createChatChannelPlugin } from "openclaw/plugin-sdk/channel-core";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/channel-core";
 import { createAccountStatusSink, waitUntilAbort } from "openclaw/plugin-sdk/channel-lifecycle";
-import type { ChannelGatewayContext } from "openclaw/plugin-sdk/channel-runtime";
+import type { ChannelGatewayContext, ChannelMessagingAdapter } from "openclaw/plugin-sdk/channel-runtime";
 import { buildProbeChannelStatusSummary } from "openclaw/plugin-sdk/channel-status";
 import { createComputedAccountStatusAdapter, createDefaultChannelRuntimeState } from "openclaw/plugin-sdk/status-helpers";
 import { Bot } from "@maxhub/max-bot-api";
+import { ensureRussianTrustedCAs } from "./certs.js";
 
 export const MAX_CHANNEL_ID = "max";
 export const DEFAULT_ACCOUNT_ID = "default";
@@ -52,6 +53,103 @@ function resolveAccount(
 /** Strip routing prefixes ("max:", "max:group:") from a delivery target. */
 export function stripMaxTarget(target: string): string {
   return target.replace(/^max:(group:)?/, "");
+}
+
+/** MAX chat ids: positive = dialog/chat id (not the user id), negative = group/channel. */
+const MAX_TARGET_ID_RE = /^-?\d{5,}$/;
+
+/** Normalize a delivery target: "max:123", "max:group:-45", "chat:123", "user:123" → bare id. */
+export function normalizeMaxTarget(raw: string): string {
+  return String(raw ?? "")
+    .trim()
+    .replace(/^max:(group:)?/i, "")
+    .replace(/^(chat|user|group):/i, "")
+    .trim();
+}
+
+/**
+ * Target adapter for the `message` tool and `openclaw message send --channel max`.
+ *
+ * Without it the core's async target resolver has no channel-specific
+ * `looksLikeId`, so `max:<chat_id>` is rejected as "Unknown target". This matters
+ * for harnesses that deliver *every* visible reply through the message tool
+ * (e.g. `deliveryDefaults.sourceVisibleReplies = "message_tool"`): inbound
+ * messages are processed, but the agent ends with "visible channel turn
+ * dispatched with no queued reply payloads" and the user never gets an answer.
+ *
+ * Note: for direct chats the delivery target is the **dialog chat id**
+ * (positive, differs from the user id); sending to a user id fails with
+ * `404 Chat not found`.
+ */
+export const maxMessaging: ChannelMessagingAdapter = {
+  targetPrefixes: ["max"],
+  normalizeTarget: (raw) => normalizeMaxTarget(raw) || undefined,
+  inferTargetChatType: ({ to }) => {
+    const id = normalizeMaxTarget(to);
+    if (!MAX_TARGET_ID_RE.test(id)) return undefined;
+    return id.startsWith("-") ? "group" : "direct";
+  },
+  targetResolver: {
+    looksLikeId: (raw, normalized) => MAX_TARGET_ID_RE.test(normalizeMaxTarget(normalized ?? raw)),
+    hint: "<chat_id> (MAX chat id: positive = dialog, negative = group/channel; not the user id)",
+    resolveTarget: async ({ normalized, input }) => {
+      const to = normalizeMaxTarget(normalized ?? input);
+      if (!MAX_TARGET_ID_RE.test(to)) return null;
+      return {
+        to,
+        kind: to.startsWith("-") ? "group" : "user",
+        display: to,
+        source: "normalized",
+      };
+    },
+  },
+};
+
+type MaxUploadType = "image" | "video" | "audio" | "file";
+
+const IMAGE_EXTS = new Set(["png", "jpg", "jpeg", "gif", "webp"]);
+const VIDEO_EXTS = new Set(["mp4", "mov", "avi", "webm", "mkv"]);
+const AUDIO_EXTS = new Set(["mp3", "ogg", "wav", "m4a", "opus"]);
+
+function resolveMaxUploadType(filename?: string, contentType?: string): MaxUploadType {
+  const ext = filename?.split(".").pop()?.toLowerCase() ?? "";
+  if (contentType?.startsWith("image/") || IMAGE_EXTS.has(ext)) return "image";
+  if (contentType?.startsWith("video/") || VIDEO_EXTS.has(ext)) return "video";
+  if (contentType?.startsWith("audio/") || AUDIO_EXTS.has(ext)) return "audio";
+  return "file";
+}
+
+/**
+ * Upload media through the raw uploads endpoint instead of the SDK helpers:
+ * max-bot-api 0.2.5 drops the upload token on the Buffer path and never reads
+ * it back from the multipart response. The token arrives either in the
+ * getUploadUrl response (range-upload flow: video/audio/file) or in the upload
+ * response JSON ("photos" map for image uploads, "token" otherwise).
+ */
+async function rawUploadMaxMedia(
+  bot: Bot,
+  type: MaxUploadType,
+  data: Buffer,
+  filename: string,
+): Promise<{ type: MaxUploadType; payload: Record<string, unknown> }> {
+  const { url, token } = await (bot.api as any).raw.uploads.getUploadUrl({ type });
+  const form = new FormData();
+  form.append("data", new Blob([data]), filename);
+  const res = await fetch(url, { method: "POST", body: form });
+  if (!res.ok) throw new Error(`media upload failed: HTTP ${res.status}`);
+  const json = (await res.json().catch(() => ({}))) as Record<string, any>;
+  if (type === "image" && json.photos && typeof json.photos === "object") {
+    return { type, payload: { photos: json.photos } };
+  }
+  const uploadToken = token ?? json.token;
+  if (uploadToken) return { type, payload: { token: uploadToken } };
+  throw new Error(`MAX API returned no upload token for type "${type}"`);
+}
+
+/** the api client returns the raw response ({ message: {...} }) */
+function extractSentMessageId(sent: any): string {
+  const mid = sent?.message?.body?.mid ?? sent?.body?.mid ?? sent?.id;
+  return mid != null ? String(mid) : String(Date.now());
 }
 
 // Store bot instance for outbound messaging
@@ -110,6 +208,7 @@ async function probeMaxAccount(account: ResolvedAccount, timeoutMs: number): Pro
 export const maxPlugin = createChatChannelPlugin<ResolvedAccount, MaxProbe>({
   base: {
     id: MAX_CHANNEL_ID,
+    messaging: maxMessaging,
     meta: {
       id: MAX_CHANNEL_ID,
       label: "MAX Messenger",
@@ -202,18 +301,46 @@ export const maxPlugin = createChatChannelPlugin<ResolvedAccount, MaxProbe>({
     attachedResults: {
       channel: MAX_CHANNEL_ID,
       sendText: async (params) => {
-        if (!botInstance) {
-          throw new Error("MAX bot not initialized");
-        }
+        const bot = ensureBotForOutbound(params.cfg);
         // chat_id works uniformly for dialogs, groups and channels
-        const sent = await botInstance.api.sendMessageToChat(
+        const sent = await bot.api.sendMessageToChat(
           Number(stripMaxTarget(params.to)),
           params.text,
           { format: "markdown" }
         );
-        // the api client returns the raw response ({ message: {...} })
-        const mid = (sent as any)?.message?.body?.mid ?? (sent as any)?.body?.mid ?? (sent as any)?.id;
-        return { messageId: mid != null ? String(mid) : String(Date.now()) };
+        return { messageId: extractSentMessageId(sent) };
+      },
+      sendMedia: async (params) => {
+        const bot = ensureBotForOutbound(params.cfg);
+        const mediaUrl = params.mediaUrl;
+        if (!mediaUrl) {
+          throw new Error("mediaUrl is required");
+        }
+        let data: Buffer;
+        let filename: string;
+        let contentType: string | undefined;
+        if (/^https?:\/\//i.test(mediaUrl)) {
+          const res = await fetch(mediaUrl);
+          if (!res.ok) throw new Error(`failed to fetch media: HTTP ${res.status}`);
+          data = Buffer.from(await res.arrayBuffer());
+          filename =
+            decodeURIComponent(new URL(mediaUrl).pathname.split("/").pop() ?? "") || "file";
+          contentType = res.headers.get("content-type") ?? undefined;
+        } else {
+          if (!params.mediaReadFile) {
+            throw new Error("local media is not readable in this context");
+          }
+          data = Buffer.from(await params.mediaReadFile(mediaUrl));
+          filename = mediaUrl.split("/").pop() || "file";
+        }
+        const uploadType = resolveMaxUploadType(filename, contentType);
+        const attachment = await rawUploadMaxMedia(bot, uploadType, data, filename);
+        const sent = await bot.api.sendMessageToChat(
+          Number(stripMaxTarget(params.to)),
+          params.text ?? "",
+          { attachments: [attachment as any] }
+        );
+        return { messageId: extractSentMessageId(sent) };
       },
     },
   },
@@ -237,6 +364,22 @@ export function initializeBot(token: string, apiBaseUrl?: string): Bot {
 // Get current bot instance
 export function getBot(): Bot | null {
   return botInstance;
+}
+
+/**
+ * Outbound sends also run outside the gateway lifecycle (e.g. the
+ * `openclaw message send` CLI loads the plugin in-process), where
+ * `initializeBot` was never called. Fall back to a send-only client built
+ * from the configured token; `Bot` only starts polling on `.start()`.
+ */
+function ensureBotForOutbound(cfg: OpenClawConfig): Bot {
+  if (botInstance) return botInstance;
+  const account = resolveAccount(cfg, DEFAULT_ACCOUNT_ID);
+  if (!account.token) throw new Error("MAX token is not configured");
+  // registerFull (which installs the Минцифры CA bundle) does not run on the
+  // bare outbound path — make sure TLS to platform-api2.max.ru verifies.
+  ensureRussianTrustedCAs();
+  return initializeBot(account.token, account.apiBaseUrl);
 }
 
 async function runMaxAccount(ctx: ChannelGatewayContext<ResolvedAccount>): Promise<void> {
@@ -327,13 +470,25 @@ async function runMaxAccount(ctx: ChannelGatewayContext<ResolvedAccount>): Promi
     // The client never passes an AbortSignal to fetch, so stop() can wait on
     // the in-flight long poll (~30s): race supervision against abort and let
     // the loop wind down in the background instead of blocking shutdown.
+    // Restarts use exponential backoff with jitter (5s → 5min) so a MAX-side
+    // outage is not hammered; a healthy run > 60s resets the delay.
+    const MIN_RESTART_DELAY_MS = 5000;
+    const MAX_RESTART_DELAY_MS = 5 * 60 * 1000;
+    const HEALTHY_RUN_MS = 60000;
+    let restartDelayMs = MIN_RESTART_DELAY_MS;
     const supervise = (async () => {
       while (!ctx.abortSignal?.aborted) {
+        const startedAt = Date.now();
         await bot.start({ allowedUpdates: ["message_created", "bot_started"] });
         if (ctx.abortSignal?.aborted) break;
-        log?.warn("[MAX] Long polling exited unexpectedly, restarting in 5s");
+        if (Date.now() - startedAt > HEALTHY_RUN_MS) restartDelayMs = MIN_RESTART_DELAY_MS;
+        const waitMs = Math.round(restartDelayMs * (0.5 + Math.random()));
+        log?.warn(`[MAX] Long polling exited unexpectedly, restarting in ${Math.round(waitMs / 1000)}s`);
         stopBot();
-        await new Promise((resolve) => setTimeout(resolve, 5000));
+        await new Promise((resolve) => setTimeout(resolve, waitMs));
+        if (ctx.abortSignal?.aborted) break;
+        restartDelayMs = Math.min(restartDelayMs * 2, MAX_RESTART_DELAY_MS);
+        log?.info("[MAX] Long polling restarting");
       }
       log?.info("[MAX] Long polling stopped");
     })();
