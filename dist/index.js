@@ -1,6 +1,7 @@
+import { timingSafeEqual } from "node:crypto";
 import { defineChannelPluginEntry } from "openclaw/plugin-sdk/channel-core";
 import { createTypingCallbacks } from "openclaw/plugin-sdk/channel-reply-pipeline";
-import { getBot, initializeBot, maxPlugin, DEFAULT_ACCOUNT_ID, MAX_CHANNEL_ID } from "./channel.js";
+import { getBot, maxPlugin, setMaxUpdateHandler, DEFAULT_ACCOUNT_ID, MAX_CHANNEL_ID } from "./channel.js";
 import { ensureRussianTrustedCAs } from "./certs.js";
 /** MAX caps message text at 4000 chars. */
 const MAX_TEXT_LIMIT = 4000;
@@ -388,8 +389,9 @@ export default defineChannelPluginEntry({
             api.logger.warn("[MAX] No token found, bot not initialized");
             return;
         }
-        const bot = initializeBot(token, section?.apiBaseUrl);
-        const baseUrl = section?.apiBaseUrl ?? "https://platform-api2.max.ru";
+        // The channel gateway lifecycle (gateway.startAccount) owns bot startup;
+        // here we expose the inbound handler and the webhook HTTP route.
+        setMaxUpdateHandler((update, handlerToken) => handleUpdate(api, update, handlerToken));
         // --- Webhook handler ---
         api.registerHttpRoute({
             path: "/max/webhook",
@@ -398,7 +400,12 @@ export default defineChannelPluginEntry({
                 try {
                     if (section?.webhookSecret) {
                         const header = req.headers["x-max-bot-api-secret"];
-                        if (header !== section.webhookSecret) {
+                        const provided = Array.isArray(header) ? header[0] : header;
+                        const expected = String(section.webhookSecret);
+                        const authorized = typeof provided === "string" &&
+                            provided.length === expected.length &&
+                            timingSafeEqual(Buffer.from(provided), Buffer.from(expected));
+                        if (!authorized) {
                             res.statusCode = 403;
                             res.end("forbidden");
                             return true;
@@ -425,54 +432,6 @@ export default defineChannelPluginEntry({
                 }
             },
         });
-        // --- Transport selection: webhook if a public URL is configured, else polling ---
-        let webhookActive = false;
-        if (section?.webhookUrl) {
-            try {
-                await bot.api.getMyInfo();
-                const resp = await fetch(`${baseUrl}/subscriptions`, {
-                    method: "POST",
-                    headers: { "content-type": "application/json", Authorization: token },
-                    body: JSON.stringify({
-                        url: section.webhookUrl,
-                        update_types: ["message_created", "bot_started"],
-                        ...(section.webhookSecret ? { secret: section.webhookSecret } : {}),
-                    }),
-                });
-                if (!resp.ok) {
-                    throw new Error(`POST /subscriptions failed: HTTP ${resp.status} ${await resp.text()}`);
-                }
-                webhookActive = true;
-                api.logger.info(`[MAX] Webhook subscribed: ${section.webhookUrl}`);
-            }
-            catch (err) {
-                api.logger.warn(`[MAX] Webhook subscription failed, falling back to polling: ${err.message}`);
-            }
-        }
-        if (!webhookActive) {
-            bot.on("message_created", async (ctx) => {
-                try {
-                    await handleUpdate(api, ctx.update ?? { update_type: "message_created", message: ctx.message }, token);
-                }
-                catch (err) {
-                    api.logger.error("[MAX] polling update failed: " + (err?.message ?? err));
-                }
-            });
-            bot.on("bot_started", async (ctx) => {
-                try {
-                    await handleUpdate(api, ctx.update ?? ctx, token);
-                }
-                catch (err) {
-                    api.logger.error("[MAX] bot_started handling failed: " + (err?.message ?? err));
-                }
-            });
-            bot
-                .start({ allowedUpdates: ["message_created", "bot_started"] })
-                .then(() => api.logger.info("[MAX] Long polling started"))
-                .catch((err) => {
-                api.logger.error("[MAX] Failed to start bot polling: " + err.message);
-            });
-        }
     },
 });
 //# sourceMappingURL=index.js.map
