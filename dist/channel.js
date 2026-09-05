@@ -29,6 +29,45 @@ function resolveAccount(cfg, accountId) {
 export function stripMaxTarget(target) {
     return target.replace(/^max:(group:)?/, "");
 }
+/** MAX chat ids: positive = dialog/chat id (not the user id), negative = group/channel. */
+const MAX_TARGET_ID_RE = /^-?\d{5,}$/;
+/** Normalize a delivery target: "max:123", "max:group:-45", "chat:123", "user:123" → bare id. */
+export function normalizeMaxTarget(raw) {
+    return String(raw ?? "")
+        .trim()
+        .replace(/^max:(group:)?/i, "")
+        .replace(/^(chat|user|group):/i, "")
+        .trim();
+}
+/**
+ * Target adapter for the `message` tool and `openclaw message send --channel max`.
+ *
+ * Without it the core's async target resolver has no channel-specific
+ * `looksLikeId`, so `max:<chat_id>` is rejected as "Unknown target". This matters
+ * for harnesses that deliver *every* visible reply through the message tool
+ * (e.g. `deliveryDefaults.sourceVisibleReplies = "message_tool"`): inbound
+ * messages are processed, but the agent ends with "visible channel turn
+ * dispatched with no queued reply payloads" and the user never gets an answer.
+ */
+export const maxMessaging = {
+    targetPrefixes: ["max"],
+    normalizeTarget: (raw) => normalizeMaxTarget(raw) || undefined,
+    targetResolver: {
+        looksLikeId: (raw, normalized) => MAX_TARGET_ID_RE.test(normalizeMaxTarget(normalized ?? raw)),
+        hint: "<chat_id> (MAX chat id: positive = dialog, negative = group/channel; not the user id)",
+        resolveTarget: async ({ normalized, input }) => {
+            const to = normalizeMaxTarget(normalized ?? input);
+            if (!MAX_TARGET_ID_RE.test(to))
+                return null;
+            return {
+                to,
+                kind: (to.startsWith("-") ? "group" : "user"),
+                display: to,
+                source: "normalized",
+            };
+        },
+    },
+};
 // Store bot instance for outbound messaging
 let botInstance = null;
 let updateHandler = null;
@@ -74,6 +113,7 @@ async function probeMaxAccount(account, timeoutMs) {
 export const maxPlugin = createChatChannelPlugin({
     base: {
         id: MAX_CHANNEL_ID,
+        messaging: maxMessaging,
         meta: {
             id: MAX_CHANNEL_ID,
             label: "MAX Messenger",

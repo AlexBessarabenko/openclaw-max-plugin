@@ -16,6 +16,35 @@ export type ResolvedAccount = {
 };
 /** Strip routing prefixes ("max:", "max:group:") from a delivery target. */
 export declare function stripMaxTarget(target: string): string;
+/** Normalize a delivery target: "max:123", "max:group:-45", "chat:123", "user:123" → bare id. */
+export declare function normalizeMaxTarget(raw: string): string;
+/**
+ * Target adapter for the `message` tool and `openclaw message send --channel max`.
+ *
+ * Without it the core's async target resolver has no channel-specific
+ * `looksLikeId`, so `max:<chat_id>` is rejected as "Unknown target". This matters
+ * for harnesses that deliver *every* visible reply through the message tool
+ * (e.g. `deliveryDefaults.sourceVisibleReplies = "message_tool"`): inbound
+ * messages are processed, but the agent ends with "visible channel turn
+ * dispatched with no queued reply payloads" and the user never gets an answer.
+ */
+export declare const maxMessaging: {
+    targetPrefixes: string[];
+    normalizeTarget: (raw: string) => string | undefined;
+    targetResolver: {
+        looksLikeId: (raw: string, normalized?: string) => boolean;
+        hint: string;
+        resolveTarget: ({ normalized, input }: {
+            normalized: string;
+            input: string;
+        }) => Promise<{
+            to: string;
+            kind: "group" | "user";
+            display: string;
+            source: "normalized";
+        } | null>;
+    };
+};
 type InboundUpdateHandler = (update: any, token: string) => Promise<void>;
 export declare function setMaxUpdateHandler(handler: InboundUpdateHandler): void;
 /**
