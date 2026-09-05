@@ -28,12 +28,33 @@ export declare function normalizeMaxTarget(raw: string): string;
  * (e.g. `deliveryDefaults.sourceVisibleReplies = "message_tool"`): inbound
  * messages are processed, but the agent ends with "visible channel turn
  * dispatched with no queued reply payloads" and the user never gets an answer.
+<<<<<<< HEAD
  *
  * Note: for direct chats the delivery target is the **dialog chat id**
  * (positive, differs from the user id); sending to a user id fails with
  * `404 Chat not found`.
  */
 export declare const maxMessaging: ChannelMessagingAdapter;
+=======
+ */
+export declare const maxMessaging: {
+    targetPrefixes: string[];
+    normalizeTarget: (raw: string) => string | undefined;
+    targetResolver: {
+        looksLikeId: (raw: string, normalized?: string) => boolean;
+        hint: string;
+        resolveTarget: ({ normalized, input }: {
+            normalized: string;
+            input: string;
+        }) => Promise<{
+            to: string;
+            kind: "group" | "user";
+            display: string;
+            source: "normalized";
+        } | null>;
+    };
+};
+>>>>>>> pr-2
 type InboundUpdateHandler = (update: any, token: string) => Promise<void>;
 export declare function setMaxUpdateHandler(handler: InboundUpdateHandler): void;
 /**

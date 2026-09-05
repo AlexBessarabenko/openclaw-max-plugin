@@ -49,20 +49,26 @@ export function normalizeMaxTarget(raw) {
  * (e.g. `deliveryDefaults.sourceVisibleReplies = "message_tool"`): inbound
  * messages are processed, but the agent ends with "visible channel turn
  * dispatched with no queued reply payloads" and the user never gets an answer.
+<<<<<<< HEAD
  *
  * Note: for direct chats the delivery target is the **dialog chat id**
  * (positive, differs from the user id); sending to a user id fails with
  * `404 Chat not found`.
+=======
+>>>>>>> pr-2
  */
 export const maxMessaging = {
     targetPrefixes: ["max"],
     normalizeTarget: (raw) => normalizeMaxTarget(raw) || undefined,
+<<<<<<< HEAD
     inferTargetChatType: ({ to }) => {
         const id = normalizeMaxTarget(to);
         if (!MAX_TARGET_ID_RE.test(id))
             return undefined;
         return id.startsWith("-") ? "group" : "direct";
     },
+=======
+>>>>>>> pr-2
     targetResolver: {
         looksLikeId: (raw, normalized) => MAX_TARGET_ID_RE.test(normalizeMaxTarget(normalized ?? raw)),
         hint: "<chat_id> (MAX chat id: positive = dialog, negative = group/channel; not the user id)",
@@ -72,13 +78,18 @@ export const maxMessaging = {
                 return null;
             return {
                 to,
+<<<<<<< HEAD
                 kind: to.startsWith("-") ? "group" : "user",
+=======
+                kind: (to.startsWith("-") ? "group" : "user"),
+>>>>>>> pr-2
                 display: to,
                 source: "normalized",
             };
         },
     },
 };
+<<<<<<< HEAD
 const IMAGE_EXTS = new Set(["png", "jpg", "jpeg", "gif", "webp"]);
 const VIDEO_EXTS = new Set(["mp4", "mov", "avi", "webm", "mkv"]);
 const AUDIO_EXTS = new Set(["mp3", "ogg", "wav", "m4a", "opus"]);
@@ -120,6 +131,8 @@ function extractSentMessageId(sent) {
     const mid = sent?.message?.body?.mid ?? sent?.body?.mid ?? sent?.id;
     return mid != null ? String(mid) : String(Date.now());
 }
+=======
+>>>>>>> pr-2
 // Store bot instance for outbound messaging
 let botInstance = null;
 let updateHandler = null;
