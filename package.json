@@ -37,6 +37,8 @@
     "src/send-file-tool.ts",
     "src/dedup.ts",
     "src/polling-state.ts",
+    "src/actions.ts",
+    "src/stickers.ts",
     "openclaw.plugin.json",
     "README.md",
     "LICENSE"

@@ -8,6 +8,7 @@ import { getAgentScopedMediaLocalRoots } from "openclaw/plugin-sdk/media-runtime
 import { downloadRemoteMedia, readLocalMedia } from "./src/media-access.js";
 import { primeSeenMessageIds, recentSeenMessageIds } from "./src/dedup.js";
 import { loadMaxPollingState, saveMaxPollingState } from "./src/polling-state.js";
+import { maxMessageActions } from "./src/actions.js";
 export const MAX_CHANNEL_ID = "max";
 export const DEFAULT_ACCOUNT_ID = "default";
 /** MAX Bot API v2 base URL (platform-api.max.ru is deprecated since 2026-07-19). */
@@ -15,7 +16,7 @@ export const DEFAULT_API_BASE_URL = "https://platform-api2.max.ru";
 function resolveAccountId(params) {
     return params.accountId ?? DEFAULT_ACCOUNT_ID;
 }
-function resolveAccount(cfg, accountId) {
+export function resolveAccount(cfg, accountId) {
     const section = cfg.channels?.[MAX_CHANNEL_ID];
     const token = section?.token ?? "";
     return {
@@ -90,6 +91,28 @@ export async function sendMaxMessage(bot, to, text, extra) {
             await new Promise((resolve) => setTimeout(resolve, ATTACHMENT_RETRY_DELAYS_MS[attempt - 1]));
         }
     }
+}
+/**
+ * Raw-structure send for attachment-only messages (stickers, contacts,
+ * locations). Unlike `sendMaxMessage`, the text field is omitted entirely
+ * when empty — MAX rejects sticker-only sends that carry an empty `text`.
+ * These attachment kinds reference existing server-side objects (no fresh
+ * upload), so the attachment.not.ready retry of `sendMaxMessage` is not
+ * needed here.
+ */
+export async function sendMaxBody(bot, to, body) {
+    const target = resolveSendTarget(to);
+    const payload = {
+        ...(body.text ? { text: body.text } : {}),
+        ...(body.attachments ? { attachments: body.attachments } : {}),
+        ...(body.link ? { link: body.link } : {}),
+        ...(body.format ? { format: body.format } : {}),
+        ...(body.notify !== undefined ? { notify: body.notify } : {}),
+    };
+    const res = "userId" in target
+        ? await bot.api.raw.messages.send({ user_id: target.userId, ...payload })
+        : await bot.api.raw.messages.send({ chat_id: target.chatId, ...payload });
+    return extractSentMessageId(res);
 }
 /**
  * Target adapter for the `message` tool and `openclaw message send --channel max`.
@@ -279,6 +302,19 @@ export const maxPlugin = createChatChannelPlugin({
                 "on the reply path (not via `openclaw message send`); a button press",
                 "returns as an inbound message carrying the payload (plus a quote of",
                 "the message the button was on) — make payloads self-describing.",
+                "",
+                "### MAX message actions",
+                'Sticker: message(action="sticker", target="<chat_id>", stickerId="<code>") — codes come',
+                "from received stickers ([Sticker (code …)] markers); omit stickerId to echo the",
+                "last sticker seen in that chat.",
+                'Location pin: message(action="sendAttachment", type="location", target="<chat_id>", latitude="55.75", longitude="37.62").',
+                'Contact card: message(action="sendAttachment", type="contact", target="<chat_id>", contactName="Name", vcfPhone="+79001234567") — or contactId=<MAX user_id>.',
+                'Edit your own message: message(action="edit", messageId="<mid>", message="new text") —',
+                "up to 7 days in dialogs; no time limit with an inline keyboard or in",
+                "groups/channels (≤2 edits/sec per chat).",
+                'Delete your own message: message(action="delete", messageId="<mid>") — no time limit.',
+                'Pin/unpin: message(action="pin", target="<chat_id>", messageId="<mid>", notify=false) /',
+                'message(action="unpin", target="<chat_id>").',
             ],
             inboundFormattingHints: () => ({
                 text_markup: "markdown",
@@ -294,6 +330,9 @@ export const maxPlugin = createChatChannelPlugin({
                 return params.cfg;
             },
         },
+        // Message-tool actions owned by the channel (edit/delete/pin/unpin/
+        // sticker/sendAttachment); plain send stays on the core outbound path.
+        actions: maxMessageActions,
         config: {
             resolveAccount,
             listAccountIds(cfg) {

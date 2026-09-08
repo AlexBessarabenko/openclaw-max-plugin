@@ -14,6 +14,7 @@ import {
 } from "./src/media-access.js";
 import { createMaxSendFileTool } from "./src/send-file-tool.js";
 import { isDuplicate } from "./src/dedup.js";
+import { rememberStickerCode } from "./src/stickers.js";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk/channel-core";
 import { resolveDmGroupAccessWithLists } from "openclaw/plugin-sdk/channel-policy";
 import { createChannelPairingController } from "openclaw/plugin-sdk/channel-pairing";
@@ -320,6 +321,51 @@ async function buildTextAndMedia(
   }
 
   for (const att of attachments.slice(0, MAX_INBOUND_ATTACHMENTS)) {
+    // Stickers: no downloadable media — cache the code per chat (so the agent
+    // can resend it) and surface it to the agent as a text marker.
+    if (att?.type === "sticker") {
+      const code = typeof att?.payload?.code === "string" ? att.payload.code : "";
+      if (code) rememberStickerCode(facts.chatId, code);
+      const emoji = typeof att?.payload?.emoji === "string" ? att.payload.emoji : "";
+      const marker = code
+        ? emoji
+          ? `[Sticker ${emoji} (code ${code})]`
+          : `[Sticker (code ${code})]`
+        : "[Sticker]";
+      text = text ? `${text}\n${marker}` : marker;
+      continue;
+    }
+
+    // Location: coordinates are top-level fields (ll=lon,lat on Yandex Maps).
+    if (att?.type === "location") {
+      const lat = att?.latitude ?? att?.payload?.latitude;
+      const lon = att?.longitude ?? att?.payload?.longitude;
+      if (lat != null && lon != null) {
+        const url = `https://yandex.ru/maps/?ll=${encodeURIComponent(`${lon},${lat}`)}&z=15`;
+        const marker = `[Location: ${lat}, ${lon}](${url})`;
+        text = text ? `${text}\n${marker}` : marker;
+      }
+      continue;
+    }
+
+    // Contact: display name from the VCard FN line, or the linked MAX profile.
+    if (att?.type === "contact") {
+      const raw = att?.payload?.vcf_info ?? "";
+      const fn = String(raw)
+        .split("\n")
+        .find((line) => line.startsWith("FN:"))
+        ?.slice(3);
+      const maxInfo = att?.payload?.max_info;
+      const maxName = maxInfo
+        ? [maxInfo.first_name, maxInfo.last_name].filter(Boolean).join(" ") ||
+          (typeof maxInfo.name === "string" ? maxInfo.name : "")
+        : "";
+      const name = fn || maxName;
+      const marker = `[Contact${name ? `: ${name}` : ""}]`;
+      text = text ? `${text}\n${marker}` : marker;
+      continue;
+    }
+
     let url =
       att?.payload?.url ?? (Array.isArray(att?.payload?.ls) ? att.payload.ls[0] : undefined);
     if (!url && att?.type === "video" && att?.payload?.token) {

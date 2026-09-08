@@ -17,6 +17,7 @@ export type ResolvedAccount = {
     apiBaseUrl: string;
     httpProxy: string | undefined;
 };
+export declare function resolveAccount(cfg: OpenClawConfig, accountId?: string | null): ResolvedAccount;
 /** Strip routing prefixes ("max:", "max:group:") from a delivery target. */
 export declare function stripMaxTarget(target: string): string;
 /**
@@ -26,6 +27,24 @@ export declare function stripMaxTarget(target: string): string;
  */
 export declare function normalizeMaxTarget(raw: string): string;
 export declare function sendMaxMessage(bot: Bot, to: string, text: string, extra?: Record<string, unknown>): Promise<any>;
+/**
+ * Raw-structure send for attachment-only messages (stickers, contacts,
+ * locations). Unlike `sendMaxMessage`, the text field is omitted entirely
+ * when empty — MAX rejects sticker-only sends that carry an empty `text`.
+ * These attachment kinds reference existing server-side objects (no fresh
+ * upload), so the attachment.not.ready retry of `sendMaxMessage` is not
+ * needed here.
+ */
+export declare function sendMaxBody(bot: Bot, to: string, body: {
+    text?: string;
+    attachments?: Array<Record<string, unknown>>;
+    link?: {
+        type: "reply";
+        mid: string;
+    };
+    format?: "markdown" | "html";
+    notify?: boolean;
+}): Promise<string>;
 /**
  * Target adapter for the `message` tool and `openclaw message send --channel max`.
  *
