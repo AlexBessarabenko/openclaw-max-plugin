@@ -1,6 +1,6 @@
 import { timingSafeEqual } from "node:crypto";
 import { defineChannelPluginEntry } from "openclaw/plugin-sdk/channel-core";
-import { createTypingCallbacks } from "openclaw/plugin-sdk/channel-reply-pipeline";
+import { createTypingCallbacks } from "openclaw/plugin-sdk/channel-outbound";
 import { getBot, getMaxFetch, maxPlugin, normalizeMaxTarget, runOutsideInheritedRootWork, setMaxUpdateHandler, resolveGroupPolicyWarning, resolveMaxSendOptions, DEFAULT_ACCOUNT_ID, MAX_CHANNEL_ID } from "./channel.js";
 import {
   resolveReplyKeyboardButtons,

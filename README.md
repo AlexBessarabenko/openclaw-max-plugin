@@ -1,7 +1,7 @@
 # OpenClaw MAX Messenger Plugin
 
 Channel plugin connecting OpenClaw to [MAX Messenger](https://max.ru) — Russian messaging platform.
-Tested with OpenClaw **2026.9.2**, MAX Bot API v2 (`platform-api2.max.ru`).
+Tested with OpenClaw **2026.9.3**, MAX Bot API v2 (`platform-api2.max.ru`).
 
 > **OpenClaw ≥ 2026.9 note:** gateway 2026.9.x starts channel accounts inside a
 > short-lived root-work admission context. Long-lived channel work (the polling

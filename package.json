@@ -9,7 +9,8 @@
   "scripts": {
     "build": "tsc",
     "dev": "tsc --watch",
-    "test": "vitest run"
+    "test": "vitest run && npm run check:sdk",
+    "check:sdk": "node scripts/check-sdk-imports.mjs"
   },
   "dependencies": {
     "@maxhub/max-bot-api": "^0.3.1",

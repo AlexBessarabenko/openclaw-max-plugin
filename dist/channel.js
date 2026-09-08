@@ -1,5 +1,5 @@
 import { createChatChannelPlugin } from "openclaw/plugin-sdk/channel-core";
-import { createAccountStatusSink, waitUntilAbort } from "openclaw/plugin-sdk/channel-lifecycle";
+import { createAccountStatusSink, waitUntilAbort } from "openclaw/plugin-sdk/channel-outbound";
 import { buildProbeChannelStatusSummary } from "openclaw/plugin-sdk/channel-status";
 import { createComputedAccountStatusAdapter, createDefaultChannelRuntimeState } from "openclaw/plugin-sdk/status-helpers";
 import { Bot } from "@maxhub/max-bot-api";

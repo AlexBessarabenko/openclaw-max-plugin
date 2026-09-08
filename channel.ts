@@ -1,6 +1,6 @@
 import { createChatChannelPlugin } from "openclaw/plugin-sdk/channel-core";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/channel-core";
-import { createAccountStatusSink, waitUntilAbort } from "openclaw/plugin-sdk/channel-lifecycle";
+import { createAccountStatusSink, waitUntilAbort } from "openclaw/plugin-sdk/channel-outbound";
 import type { ChannelGatewayContext } from "openclaw/plugin-sdk/channel-contract";
 import type { ChannelMessagingAdapter } from "openclaw/plugin-sdk/core";
 import { buildProbeChannelStatusSummary } from "openclaw/plugin-sdk/channel-status";
