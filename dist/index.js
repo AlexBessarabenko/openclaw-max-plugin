@@ -1,7 +1,7 @@
 import { timingSafeEqual } from "node:crypto";
 import { defineChannelPluginEntry } from "openclaw/plugin-sdk/channel-core";
 import { createTypingCallbacks } from "openclaw/plugin-sdk/channel-reply-pipeline";
-import { getBot, getMaxFetch, maxPlugin, normalizeMaxTarget, runOutsideInheritedRootWork, setMaxUpdateHandler, DEFAULT_ACCOUNT_ID, MAX_CHANNEL_ID } from "./channel.js";
+import { getBot, getMaxFetch, maxPlugin, normalizeMaxTarget, runOutsideInheritedRootWork, setMaxUpdateHandler, resolveGroupPolicyWarning, DEFAULT_ACCOUNT_ID, MAX_CHANNEL_ID } from "./channel.js";
 import { resolveReplyKeyboardButtons, toInlineKeyboardAttachment, } from "./src/keyboards.js";
 import { downloadRemoteMedia, MAX_ATTACHMENT_BYTES, MAX_INBOUND_ATTACHMENTS, } from "./src/media-access.js";
 import { createMaxSendFileTool } from "./src/send-file-tool.js";
@@ -62,6 +62,10 @@ function extractInboundFacts(update) {
             ? link.sender?.name ||
                 [link.sender?.first_name, link.sender?.last_name].filter(Boolean).join(" ")
             : "";
+        const replyToSender = link?.type === "reply"
+            ? { replyToSenderId: link.sender?.user_id != null ? String(link.sender.user_id) : undefined,
+                replyToSenderIsBot: Boolean(link.sender?.is_bot) }
+            : {};
         if (link?.type === "forward") {
             if (!text && linkBody.text)
                 text = linkBody.text;
@@ -94,6 +98,7 @@ function extractInboundFacts(update) {
                 isGroup: (recipient.chat_type ?? m.chat_type ?? "dialog") !== "dialog",
                 timestamp: m.timestamp ?? update.timestamp,
                 attachments,
+                ...replyToSender,
             };
         }
         return {
@@ -106,6 +111,7 @@ function extractInboundFacts(update) {
             isGroup: (recipient.chat_type ?? m.chat_type ?? "dialog") !== "dialog",
             timestamp: m.timestamp,
             attachments,
+            ...replyToSender,
         };
     }
     // "Начать" button pressed in a dialog; payload carries the deep-link parameter
@@ -636,6 +642,99 @@ async function checkDmAccess(api, facts) {
     }
     return false;
 }
+function escapeRegExp(s) {
+    return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+/**
+ * Cached bot identity (user id + username) for group mention detection.
+ * Fetched lazily via getBot() on first use — through the exported getter so
+ * tests and re-initialization both see the current bot.
+ */
+let botIdentity = null;
+let botIdentityPromise = null;
+async function ensureBotIdentity() {
+    if (botIdentity)
+        return botIdentity;
+    botIdentityPromise ??= (async () => {
+        try {
+            const me = await getBot()?.api.getMyInfo();
+            botIdentity = { userId: me?.user_id, username: me?.username };
+        }
+        catch {
+            botIdentity = {};
+        }
+        return botIdentity;
+    })();
+    return botIdentityPromise;
+}
+/**
+ * Group access gate — runs BEFORE any attachment download or disk write (same
+ * principle as the DM gate). Defaults preserve the pre-0.5 behavior: without
+ * config, groups are open and no mention is required.
+ *
+ * - groupPolicy "disabled" → all group traffic is ignored;
+ * - "allowlist" → the chat must appear in `groups` (or via the "*" wildcard)
+ *   and, when groupAllowFrom is non-empty, the sender must be listed;
+ * - per-group `enabled: false` switches a single group off;
+ * - requireMention (per-group → "*" → top-level, default false): the bot
+ *   answers only when @-mentioned by username or replied to. Button presses
+ *   (message_callback) are interactions with the bot's own message and always
+ *   count as a mention.
+ */
+async function checkGroupAccess(api, facts) {
+    if (!facts.isGroup)
+        return true;
+    const rt = api.runtime;
+    const cfg = rt?.config?.current?.() ?? api.config ?? {};
+    const section = cfg?.channels?.[MAX_CHANNEL_ID] ?? {};
+    const drop = (reason) => {
+        api.logger.info(`[MAX] group message dropped: ${reason} (chat=${facts.chatId})`);
+        return false;
+    };
+    const groupPolicy = section.groupPolicy ?? "open";
+    if (groupPolicy === "disabled")
+        return drop("groupPolicy=disabled");
+    const groups = section.groups ?? {};
+    const groupCfg = groups[facts.chatId] ?? groups["*"];
+    if (groupPolicy === "allowlist") {
+        if (!(facts.chatId in groups) && !("*" in groups)) {
+            return drop("chat not in groups allowlist");
+        }
+        const groupAllowFrom = section.groupAllowFrom ?? [];
+        if (groupAllowFrom.length > 0) {
+            const allowed = groupAllowFrom.some((entry) => normalizeMaxTarget(String(entry)).replace(/^user:/i, "") === String(facts.senderId));
+            if (!allowed)
+                return drop("sender not in groupAllowFrom");
+        }
+    }
+    if (groupCfg?.enabled === false)
+        return drop("group disabled via groups config");
+    const requireMention = typeof groupCfg?.requireMention === "boolean"
+        ? groupCfg.requireMention
+        : typeof section.requireMention === "boolean"
+            ? section.requireMention
+            : false;
+    if (!requireMention)
+        return true;
+    // Button presses on the bot's own keyboard are implicit mentions.
+    if (facts.callbackId)
+        return true;
+    // Reply to one of the bot's messages counts as a mention (Telegram-style).
+    if (facts.replyToSenderIsBot)
+        return true;
+    const identity = await ensureBotIdentity();
+    if (facts.replyToSenderId &&
+        identity.userId != null &&
+        facts.replyToSenderId === String(identity.userId)) {
+        return true;
+    }
+    if (identity.username) {
+        const mentionRe = new RegExp(`@${escapeRegExp(identity.username)}\\b`, "i");
+        if (mentionRe.test(facts.text))
+            return true;
+    }
+    return drop("bot not mentioned (requireMention)");
+}
 /** Shared update handler for webhook and polling transports. */
 export async function handleUpdate(api, update, token) {
     const facts = extractInboundFacts(update);
@@ -666,6 +765,8 @@ export async function handleUpdate(api, update, token) {
     // blocked sender causes zero fetches and zero disk writes.
     if (!(await checkDmAccess(api, facts)))
         return;
+    if (!(await checkGroupAccess(api, facts)))
+        return;
     await runInbound(api, facts, token);
 }
 export default defineChannelPluginEntry({
@@ -694,6 +795,9 @@ export default defineChannelPluginEntry({
             api.logger.warn("[MAX] No token found, bot not initialized");
             return;
         }
+        const groupWarning = resolveGroupPolicyWarning(section);
+        if (groupWarning)
+            api.logger.warn(`[MAX] ${groupWarning}`);
         // The channel gateway lifecycle (gateway.startAccount) owns bot startup;
         // here we expose the inbound handler and the webhook HTTP route.
         setMaxUpdateHandler((update, handlerToken) => handleUpdate(api, update, handlerToken));

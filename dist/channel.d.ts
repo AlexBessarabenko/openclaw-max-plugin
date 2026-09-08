@@ -54,6 +54,11 @@ export declare function rawUploadMaxMedia(bot: Bot, type: MaxUploadType, data: B
     type: MaxUploadType;
     payload: Record<string, unknown>;
 }>;
+/**
+ * Startup warning for the permissive group posture: with groupPolicy=open and
+ * no groupAllowFrom the bot answers everyone in every group it is added to.
+ */
+export declare function resolveGroupPolicyWarning(section: any): string | null;
 /** Scoped fetch for direct calls outside bot init (probes, attachment downloads). */
 export declare function getMaxFetch(): (input: any, init?: any) => Promise<any>;
 type InboundUpdateHandler = (update: any, token: string) => Promise<void>;

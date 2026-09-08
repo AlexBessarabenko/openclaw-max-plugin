@@ -33,7 +33,26 @@
           "webhookSecret": { "type": "string" },
           "apiBaseUrl": { "type": "string" },
           "httpProxy": { "type": "string" },
-          "streaming": { "type": "boolean" }
+          "streaming": { "type": "boolean" },
+          "groupPolicy": {
+            "type": "string",
+            "enum": ["open", "allowlist", "disabled"]
+          },
+          "groupAllowFrom": {
+            "type": "array",
+            "items": { "type": "string" }
+          },
+          "requireMention": { "type": "boolean" },
+          "groups": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "object",
+              "properties": {
+                "requireMention": { "type": "boolean" },
+                "enabled": { "type": "boolean" }
+              }
+            }
+          }
         }
       },
       "uiHints": {

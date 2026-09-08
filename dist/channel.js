@@ -181,6 +181,20 @@ function extractSentMessageId(sent) {
 }
 // Store bot instance for outbound messaging
 let botInstance = null;
+/**
+ * Startup warning for the permissive group posture: with groupPolicy=open and
+ * no groupAllowFrom the bot answers everyone in every group it is added to.
+ */
+export function resolveGroupPolicyWarning(section) {
+    const groupPolicy = section?.groupPolicy ?? "open";
+    const groupAllowFrom = Array.isArray(section?.groupAllowFrom) ? section.groupAllowFrom : [];
+    if (groupPolicy === "open" && groupAllowFrom.length === 0) {
+        return ("channels.max.groupPolicy is \"open\" and groupAllowFrom is empty: " +
+            "the bot will answer every member of every group it joins. " +
+            "Set groupPolicy/allowlist or groupAllowFrom to restrict this.");
+    }
+    return null;
+}
 /** Scoped fetch of the currently initialized account (proxy-aware). */
 let maxFetch = createMaxScopedFetch();
 /** Scoped fetch for direct calls outside bot init (probes, attachment downloads). */
@@ -254,6 +268,7 @@ export const maxPlugin = createChatChannelPlugin({
                 "Delivery target: dialog chat id (positive) or `user:<user_id>` for DMs;",
                 "group/channel ids are negative.",
                 "Attach media via the message tool `media` param (local path or URL).",
+                "Groups: the bot may answer only when @-mentioned or replied to (requireMention config).",
                 "Inline keyboards: pass `channelData.maxInlineKeyboard` on the message tool —",
                 "an array of rows, each row an array of buttons `{text, url?, payload?}`",
                 "(url → link button, otherwise callback; payload defaults to the label) or",
