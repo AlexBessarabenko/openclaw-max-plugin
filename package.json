@@ -34,6 +34,8 @@
     "src/keyboards.ts",
     "src/media-access.ts",
     "src/send-file-tool.ts",
+    "src/dedup.ts",
+    "src/polling-state.ts",
     "openclaw.plugin.json",
     "README.md",
     "LICENSE"

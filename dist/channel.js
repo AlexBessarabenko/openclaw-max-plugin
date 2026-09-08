@@ -6,6 +6,8 @@ import { Bot } from "@maxhub/max-bot-api";
 import { createMaxScopedFetch } from "./certs.js";
 import { getAgentScopedMediaLocalRoots } from "openclaw/plugin-sdk/media-runtime";
 import { downloadRemoteMedia, readLocalMedia } from "./src/media-access.js";
+import { primeSeenMessageIds, recentSeenMessageIds } from "./src/dedup.js";
+import { loadMaxPollingState, saveMaxPollingState } from "./src/polling-state.js";
 export const MAX_CHANNEL_ID = "max";
 export const DEFAULT_ACCOUNT_ID = "default";
 /** MAX Bot API v2 base URL (platform-api.max.ru is deprecated since 2026-07-19). */
@@ -62,11 +64,32 @@ function resolveSendTarget(to) {
         return { userId: Number(t.slice(5)) };
     return { chatId: Number(t) };
 }
+/**
+ * MAX processes fresh uploads asynchronously; sending right after an upload
+ * can fail with `attachment.not.ready`. Retry the SEND (never the upload)
+ * with a growing pause, only for that error, only when attachments ride along
+ * (6 attempts total: 1.5s → 4s between them).
+ */
+const ATTACHMENT_NOT_READY_RE = /attachment\.not\.ready/;
+const ATTACHMENT_RETRY_DELAYS_MS = [1500, 2000, 2500, 3000, 4000];
 export async function sendMaxMessage(bot, to, text, extra) {
     const target = resolveSendTarget(to);
-    return "userId" in target
-        ? bot.api.sendMessageToUser(target.userId, text, extra)
-        : bot.api.sendMessageToChat(target.chatId, text, extra);
+    const hasAttachments = Array.isArray(extra?.attachments) && extra.attachments.length > 0;
+    const maxAttempts = hasAttachments ? 1 + ATTACHMENT_RETRY_DELAYS_MS.length : 1;
+    for (let attempt = 1;; attempt++) {
+        try {
+            return "userId" in target
+                ? await bot.api.sendMessageToUser(target.userId, text, extra)
+                : await bot.api.sendMessageToChat(target.chatId, text, extra);
+        }
+        catch (err) {
+            const reason = String(err?.code ?? err?.message ?? err);
+            if (!hasAttachments || attempt >= maxAttempts || !ATTACHMENT_NOT_READY_RE.test(reason)) {
+                throw err;
+            }
+            await new Promise((resolve) => setTimeout(resolve, ATTACHMENT_RETRY_DELAYS_MS[attempt - 1]));
+        }
+    }
 }
 /**
  * Target adapter for the `message` tool and `openclaw message send --channel max`.
@@ -392,6 +415,92 @@ export function ensureBotForOutbound(cfg) {
         throw new Error("MAX token is not configured");
     return initializeBot(account.token, account.apiBaseUrl, account.httpProxy);
 }
+/** Update types the polling loop asks for (webhook subscription mirrors this). */
+const POLL_ALLOWED_UPDATES = ["message_created", "message_callback", "bot_started", "message_edited"];
+/** Transient polling errors, mirroring the SDK's Polling.shouldRetry. */
+function isTransientPollingError(err) {
+    if (!err || typeof err !== "object")
+        return false;
+    if (typeof err.status === "number")
+        return err.status === 429 || err.status >= 500;
+    return err.name === "TypeError";
+}
+/**
+ * Long-polling loop with a persistent marker (at-least-once delivery).
+ *
+ * The SDK's own Polling advances its marker in memory before processing; a
+ * gateway restart then loses or replays updates inside the server retention
+ * window. Here the marker (plus the tail of the dedup list) is persisted only
+ * AFTER the whole batch has been handed to the inbound handler. A crash
+ * mid-batch replays at most one batch; the persisted dedup ids make the
+ * replay a no-op. If any update in the batch failed, the in-memory marker
+ * still advances (no poison-message loop) but nothing is persisted, so the
+ * failed batch is retried after a restart.
+ */
+export async function runPollingLoop(params) {
+    const { bot, accountId, token, handler, signal, log } = params;
+    let marker;
+    try {
+        const state = await loadMaxPollingState(accountId);
+        if (typeof state.marker === "number")
+            marker = state.marker;
+        if (state.seenMessageIds?.length)
+            primeSeenMessageIds(state.seenMessageIds);
+        if (marker != null)
+            log?.info?.(`[MAX] polling resumes from persisted marker ${marker}`);
+    }
+    catch (err) {
+        log?.warn?.(`[MAX] polling state load failed, starting fresh: ${err?.message ?? err}`);
+    }
+    const BASE_DELAY_MS = 5000;
+    const MAX_DELAY_MS = 60000;
+    let delayMs = BASE_DELAY_MS;
+    while (!signal?.aborted) {
+        let batchFailed = false;
+        try {
+            const { updates, marker: next } = await bot.api.getUpdates(POLL_ALLOWED_UPDATES, {
+                marker,
+                limit: 100,
+                timeout: 30,
+                signal,
+            });
+            delayMs = BASE_DELAY_MS;
+            for (const update of updates ?? []) {
+                try {
+                    await handler(update, token);
+                }
+                catch (err) {
+                    batchFailed = true;
+                    log?.error?.(`[MAX] polling update failed: ${err?.message ?? err}`);
+                }
+            }
+            if (typeof next === "number") {
+                marker = next;
+                if (!batchFailed) {
+                    try {
+                        await saveMaxPollingState(accountId, {
+                            marker,
+                            seenMessageIds: recentSeenMessageIds(),
+                        });
+                    }
+                    catch (err) {
+                        log?.warn?.(`[MAX] polling state persist failed: ${err?.message ?? err}`);
+                    }
+                }
+            }
+        }
+        catch (err) {
+            if (signal?.aborted || err?.name === "AbortError")
+                return;
+            if (isTransientPollingError(err)) {
+                await new Promise((resolve) => setTimeout(resolve, delayMs));
+                delayMs = Math.min(delayMs * 2, MAX_DELAY_MS);
+                continue;
+            }
+            throw err;
+        }
+    }
+}
 async function runMaxAccount(ctx) {
     const account = ctx.account;
     const log = ctx.log;
@@ -421,7 +530,7 @@ async function runMaxAccount(ctx) {
                 headers: { "content-type": "application/json", Authorization: account.token },
                 body: JSON.stringify({
                     url: account.webhookUrl,
-                    update_types: ["message_created", "message_callback", "bot_started"],
+                    update_types: ["message_created", "message_callback", "bot_started", "message_edited"],
                     ...(account.webhookSecret ? { secret: account.webhookSecret } : {}),
                 }),
             });
@@ -449,48 +558,13 @@ async function runMaxAccount(ctx) {
             await waitUntilAbort(ctx.abortSignal);
             return;
         }
-        bot.catch((err) => {
-            log?.error(`[MAX] Bot middleware error: ${err?.message ?? err}`);
-        });
-        bot.on("message_created", async (botCtx) => {
-            try {
-                await handler(botCtx.update ?? { update_type: "message_created", message: botCtx.message }, account.token);
-            }
-            catch (err) {
-                log?.error("[MAX] polling update failed: " + (err?.message ?? err));
-            }
-        });
-        bot.on("message_callback", async (botCtx) => {
-            try {
-                await handler(botCtx.update ?? { update_type: "message_callback", callback: botCtx.callback }, account.token);
-            }
-            catch (err) {
-                log?.error("[MAX] message_callback handling failed: " + (err?.message ?? err));
-            }
-        });
-        bot.on("bot_started", async (botCtx) => {
-            try {
-                await handler(botCtx.update ?? botCtx, account.token);
-            }
-            catch (err) {
-                log?.error("[MAX] bot_started handling failed: " + (err?.message ?? err));
-            }
-        });
         log?.info("[MAX] Long polling started");
-        // max-bot-api 0.3.1 reads bot.botInfo.username in startPolling but only
-        // populates botInfo in the legacy start() flow — fetch it explicitly,
-        // otherwise polling dies instantly on a TypeError and retries forever.
-        try {
-            bot.botInfo = await bot.api.getMyInfo();
-        }
-        catch (err) {
-            log?.warn(`[MAX] getMyInfo failed before polling: ${err?.message ?? err}`);
-        }
-        // bot.startPolling() resolves when polling stops. max-bot-api ≥ 0.3.1
-        // retries transient errors internally and honors AbortSignal; the
-        // supervisor stays as a safety net for silent exits. Restarts use
-        // exponential backoff with jitter (5s → 5min) so a MAX-side outage is
-        // not hammered; a healthy run > 60s resets the delay.
+        // Own polling loop (the SDK's Polling keeps the marker in memory only):
+        // the marker + recent dedup ids are persisted AFTER each fully processed
+        // batch, so a gateway restart replays at most one batch and the persisted
+        // dedup snapshot absorbs it (at-least-once). Transient errors retry with
+        // exponential backoff inside the loop; anything else propagates to the
+        // account supervisor below.
         const MIN_RESTART_DELAY_MS = 5000;
         const MAX_RESTART_DELAY_MS = 5 * 60 * 1000;
         const HEALTHY_RUN_MS = 60000;
@@ -498,7 +572,14 @@ async function runMaxAccount(ctx) {
         const supervise = (async () => {
             while (!ctx.abortSignal?.aborted) {
                 const startedAt = Date.now();
-                await bot.startPolling({ allowedUpdates: ["message_created", "message_callback", "bot_started"] });
+                await runPollingLoop({
+                    bot,
+                    accountId: ctx.accountId,
+                    token: account.token,
+                    handler,
+                    signal: ctx.abortSignal,
+                    log,
+                });
                 if (ctx.abortSignal?.aborted)
                     break;
                 if (Date.now() - startedAt > HEALTHY_RUN_MS)

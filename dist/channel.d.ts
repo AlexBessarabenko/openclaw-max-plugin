@@ -88,5 +88,29 @@ export declare function getBot(): Bot | null;
  * from the configured token; `Bot` only starts polling on `.startPolling()`.
  */
 export declare function ensureBotForOutbound(cfg: OpenClawConfig): Bot;
+/**
+ * Long-polling loop with a persistent marker (at-least-once delivery).
+ *
+ * The SDK's own Polling advances its marker in memory before processing; a
+ * gateway restart then loses or replays updates inside the server retention
+ * window. Here the marker (plus the tail of the dedup list) is persisted only
+ * AFTER the whole batch has been handed to the inbound handler. A crash
+ * mid-batch replays at most one batch; the persisted dedup ids make the
+ * replay a no-op. If any update in the batch failed, the in-memory marker
+ * still advances (no poison-message loop) but nothing is persisted, so the
+ * failed batch is retried after a restart.
+ */
+export declare function runPollingLoop(params: {
+    bot: Bot;
+    accountId: string;
+    token: string;
+    handler: InboundUpdateHandler;
+    signal?: AbortSignal;
+    log?: {
+        info?: (msg: string) => void;
+        warn?: (msg: string) => void;
+        error?: (msg: string) => void;
+    };
+}): Promise<void>;
 export {};
 //# sourceMappingURL=channel.d.ts.map

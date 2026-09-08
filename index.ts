@@ -13,29 +13,13 @@ import {
   MAX_INBOUND_ATTACHMENTS,
 } from "./src/media-access.js";
 import { createMaxSendFileTool } from "./src/send-file-tool.js";
+import { isDuplicate } from "./src/dedup.js";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk/channel-core";
 import { resolveDmGroupAccessWithLists } from "openclaw/plugin-sdk/channel-policy";
 import { createChannelPairingController } from "openclaw/plugin-sdk/channel-pairing";
 
 /** MAX caps message text at 4000 chars. */
 const MAX_TEXT_LIMIT = 4000;
-// Deduplication: messageId → timestamp (TTL 5 min)
-const seenMessages = new Map<string, number>();
-const DEDUP_TTL_MS = 5 * 60 * 1000;
-
-function isDuplicate(messageId: string): boolean {
-  const now = Date.now();
-  for (const [id, ts] of seenMessages.entries()) {
-    if (now - ts > DEDUP_TTL_MS) {
-      seenMessages.delete(id);
-    }
-  }
-  if (seenMessages.has(messageId)) {
-    return true;
-  }
-  seenMessages.set(messageId, now);
-  return false;
-}
 
 function chunkText(text: string, limit: number): string[] {
   const chunks: string[] = [];
@@ -65,11 +49,26 @@ type InboundFacts = {
   replyTarget?: string;
 };
 
+/**
+ * Mids of our own streaming-draft messages. MAX echoes the bot's edits back as
+ * message_edited updates; without this filter every draft edit would re-enter
+ * the inbound pipeline and loop the agent.
+ */
+const ownDraftMids = new Set<string>();
+const OWN_DRAFT_MIDS_LIMIT = 1000;
+
+function noteOwnDraftMid(mid: string | null): void {
+  if (!mid) return;
+  if (ownDraftMids.size >= OWN_DRAFT_MIDS_LIMIT) ownDraftMids.clear();
+  ownDraftMids.add(mid);
+}
+
 /** Normalize a raw MAX update (webhook or polling) into inbound facts. */
 function extractInboundFacts(update: any): InboundFacts | null {
   const type = update?.update_type;
 
-  if (type === "message_created" && update.message) {
+  if ((type === "message_created" || type === "message_edited") && update.message) {
+    const isEdit = type === "message_edited";
     const m = update.message;
     const sender = m.sender ?? {};
     const recipient = m.recipient ?? {};
@@ -77,6 +76,10 @@ function extractInboundFacts(update: any): InboundFacts | null {
     const chatId = recipient.chat_id ?? m.chat_id ?? update.chat_id;
     const senderId = sender.user_id ?? m.sender_id;
     if (chatId == null || senderId == null) return null;
+    const rawMid = body.mid ?? m.id;
+    // Our own streaming-draft edits echo back as message_edited — drop them
+    // (a non-bot sender with a known draft mid is still our own edit).
+    if (isEdit && rawMid != null && ownDraftMids.has(String(rawMid))) return null;
     const senderName =
       sender.name ||
       [sender.first_name, sender.last_name].filter(Boolean).join(" ") ||
@@ -107,6 +110,23 @@ function extractInboundFacts(update: any): InboundFacts | null {
         ? `[Reply to ${linkSenderName || "unknown"}: "${clipped}"]`
         : `[Reply to ${linkSenderName || "unknown"}]`;
       text = text ? `${marker}\n${text}` : marker;
+    }
+
+    if (isEdit) {
+      // The event carries the full new text (no refetch needed). The unique
+      // suffix keeps the edit from being swallowed by mid dedup.
+      const editedTs = m.timestamp ?? update.timestamp ?? Date.now();
+      return {
+        messageId: `${rawMid ?? `${chatId}:${body.seq ?? editedTs}`}_edited_${editedTs}`,
+        text: text ? `[Edited]\n${text}` : "[Edited]",
+        senderId: String(senderId),
+        senderName,
+        senderIsBot: Boolean(sender.is_bot),
+        chatId: String(chatId),
+        isGroup: (recipient.chat_type ?? m.chat_type ?? "dialog") !== "dialog",
+        timestamp: m.timestamp ?? update.timestamp,
+        attachments,
+      };
     }
 
     return {
@@ -241,6 +261,37 @@ type MediaFact = {
   transcribed?: boolean;
 };
 
+/**
+ * Inbound video attachments often carry only a token. Resolve a playback URL
+ * via getVideoInfo (best available mp4, hls as fallback); urls === null means
+ * the video is not ready/available — the message then keeps the plain marker.
+ */
+async function resolveVideoPlaybackUrl(
+  api: OpenClawPluginApi,
+  token: string,
+): Promise<string | undefined> {
+  const bot = getBot();
+  if (!bot) return undefined;
+  try {
+    const info = await (bot.api as any).getVideoInfo(token);
+    const urls = info?.urls;
+    if (!urls) return undefined;
+    return (
+      urls.mp4_1080 ??
+      urls.mp4_720 ??
+      urls.mp4_480 ??
+      urls.mp4_360 ??
+      urls.mp4_240 ??
+      urls.mp4_144 ??
+      urls.hls ??
+      undefined
+    );
+  } catch (err: any) {
+    api.logger.warn(`[MAX] getVideoInfo failed: ${err?.message ?? err}`);
+    return undefined;
+  }
+}
+
 /** Download attachments into the media store; voice is transcribed by the core media-understanding pipeline (`tools.media.audio`). */
 async function buildTextAndMedia(
   api: OpenClawPluginApi,
@@ -259,7 +310,11 @@ async function buildTextAndMedia(
   }
 
   for (const att of attachments.slice(0, MAX_INBOUND_ATTACHMENTS)) {
-    const url = att?.payload?.url ?? (Array.isArray(att?.payload?.ls) ? att.payload.ls[0] : undefined);
+    let url =
+      att?.payload?.url ?? (Array.isArray(att?.payload?.ls) ? att.payload.ls[0] : undefined);
+    if (!url && att?.type === "video" && att?.payload?.token) {
+      url = await resolveVideoPlaybackUrl(api, att.payload.token);
+    }
     if (!url) continue;
 
     if (att.type === "audio") {
@@ -483,6 +538,7 @@ async function runInbound(api: OpenClawPluginApi, facts: InboundFacts, token: st
               draft.mid = extractMid(
                 await sendReplyMessage(bot, preview, { format: "markdown" }),
               );
+              noteOwnDraftMid(draft.mid);
             } catch {
               draft.mid = null;
             }
