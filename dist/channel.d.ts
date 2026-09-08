@@ -74,12 +74,45 @@ export declare function rawUploadMaxMedia(bot: Bot, type: MaxUploadType, data: B
     payload: Record<string, unknown>;
 }>;
 /**
+ * Send one media message. Remote image URLs ride by URL (attachment
+ * payload.url) — MAX fetches the link server-side, no upload round trip;
+ * the host is screened the same way the download path is (private/loopback
+ * hosts are refused). Everything else (non-image URLs, local files) goes
+ * through the SSRF-guarded download + upload flow.
+ */
+export declare function sendMaxMedia(bot: Bot, params: {
+    to: string;
+    text?: string;
+    mediaUrl: string;
+    mediaReadFile?: (filePath: string) => Promise<Buffer>;
+    mediaLocalRoots?: readonly string[];
+    extra?: Record<string, unknown>;
+}): Promise<string>;
+/**
  * Startup warning for the permissive group posture: with groupPolicy=open and
  * no groupAllowFrom the bot answers everyone in every group it is added to.
  */
 export declare function resolveGroupPolicyWarning(section: any): string | null;
 /** Scoped fetch for direct calls outside bot init (probes, attachment downloads). */
 export declare function getMaxFetch(): (input: any, init?: any) => Promise<any>;
+/**
+ * Pairing approval notice, sent after `openclaw pairing approve` (with
+ * --notify). The pairing id is a MAX user id — the reply goes through
+ * sendMessageToUser (the bare user id is not a chat id).
+ */
+export declare function sendMaxPairingApproval(bot: Bot, id: string): Promise<void>;
+/** Masked token preview for diagnostics: first/last 4 chars, never the secret. */
+export declare function maskMaxToken(token: string): string | null;
+/**
+ * Per-message send options: `channelData.maxNotify` / `maxDisableLinkPreview`
+ * override the channel config defaults (`channels.max.notify` /
+ * `disableLinkPreview`). Unset fields are omitted — the MAX server default
+ * (notify on, link preview on) applies.
+ */
+export declare function resolveMaxSendOptions(cfg: OpenClawConfig, channelData?: unknown): {
+    notify?: boolean;
+    disable_link_preview?: boolean;
+};
 type InboundUpdateHandler = (update: any, token: string) => Promise<void>;
 export declare function setMaxUpdateHandler(handler: InboundUpdateHandler): void;
 /**

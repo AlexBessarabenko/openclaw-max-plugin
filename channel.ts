@@ -9,6 +9,7 @@ import { Bot } from "@maxhub/max-bot-api";
 import { createMaxScopedFetch } from "./certs.js";
 import { getAgentScopedMediaLocalRoots } from "openclaw/plugin-sdk/media-runtime";
 import { downloadRemoteMedia, readLocalMedia } from "./src/media-access.js";
+import { isPrivateOrLoopbackHost } from "openclaw/plugin-sdk/ssrf-runtime";
 import { primeSeenMessageIds, recentSeenMessageIds } from "./src/dedup.js";
 import { loadMaxPollingState, saveMaxPollingState } from "./src/polling-state.js";
 import { maxMessageActions } from "./src/actions.js";
@@ -255,6 +256,62 @@ function extractSentMessageId(sent: any): string {
   return mid != null ? String(mid) : String(Date.now());
 }
 
+/**
+ * Send one media message. Remote image URLs ride by URL (attachment
+ * payload.url) — MAX fetches the link server-side, no upload round trip;
+ * the host is screened the same way the download path is (private/loopback
+ * hosts are refused). Everything else (non-image URLs, local files) goes
+ * through the SSRF-guarded download + upload flow.
+ */
+export async function sendMaxMedia(
+  bot: Bot,
+  params: {
+    to: string;
+    text?: string;
+    mediaUrl: string;
+    mediaReadFile?: (filePath: string) => Promise<Buffer>;
+    mediaLocalRoots?: readonly string[];
+    extra?: Record<string, unknown>;
+  },
+): Promise<string> {
+  const mediaUrl = params.mediaUrl;
+  let attachment: Record<string, unknown>;
+  if (/^https?:\/\//i.test(mediaUrl)) {
+    const filename =
+      decodeURIComponent(new URL(mediaUrl).pathname.split("/").pop() ?? "") || "file";
+    if (resolveMaxUploadType(filename) === "image") {
+      const host = new URL(mediaUrl).hostname;
+      if (isPrivateOrLoopbackHost(host)) {
+        throw new Error(`refusing to send image by URL: private or loopback host "${host}"`);
+      }
+      attachment = { type: "image", payload: { url: mediaUrl } };
+    } else {
+      // SSRF-guarded download; scoped MAX fetch (CA/proxy) stays in effect
+      const fetched = await downloadRemoteMedia({ url: mediaUrl, fetchImpl: getMaxFetch() });
+      attachment = await rawUploadMaxMedia(
+        bot,
+        resolveMaxUploadType(filename, fetched.contentType || undefined),
+        fetched.buffer,
+        filename,
+      );
+    }
+  } else {
+    // Local paths only via the host reader or inside the allowed media
+    // roots — otherwise an agent-named path could exfiltrate any file.
+    const data = await readLocalMedia(mediaUrl, {
+      mediaReadFile: params.mediaReadFile,
+      mediaLocalRoots: params.mediaLocalRoots,
+    });
+    const filename = mediaUrl.split("/").pop() || "file";
+    attachment = await rawUploadMaxMedia(bot, resolveMaxUploadType(filename), data, filename);
+  }
+  const sent = await sendMaxMessage(bot, params.to, params.text ?? "", {
+    ...(params.extra ?? {}),
+    attachments: [attachment as any],
+  });
+  return extractSentMessageId(sent);
+}
+
 // Store bot instance for outbound messaging
 let botInstance: Bot | null = null;
 
@@ -282,6 +339,63 @@ let maxFetch = createMaxScopedFetch();
 /** Scoped fetch for direct calls outside bot init (probes, attachment downloads). */
 export function getMaxFetch() {
   return maxFetch;
+}
+
+/**
+ * Pairing approval notice, sent after `openclaw pairing approve` (with
+ * --notify). The pairing id is a MAX user id — the reply goes through
+ * sendMessageToUser (the bare user id is not a chat id).
+ */
+export async function sendMaxPairingApproval(bot: Bot, id: string): Promise<void> {
+  const userId = Number(String(id).trim().replace(/^user:/i, ""));
+  if (!Number.isFinite(userId)) {
+    throw new Error(`pairing id "${id}" is not a MAX user id`);
+  }
+  await bot.api.sendMessageToUser(
+    userId,
+    "✅ Доступ одобрен. Можете продолжать диалог с ботом.",
+    { format: "markdown" },
+  );
+}
+
+/** Masked token preview for diagnostics: first/last 4 chars, never the secret. */
+export function maskMaxToken(token: string): string | null {
+  if (!token) return null;
+  if (token.length <= 8) return "****";
+  return `${token.slice(0, 4)}…${token.slice(-4)}`;
+}
+
+/**
+ * Per-message send options: `channelData.maxNotify` / `maxDisableLinkPreview`
+ * override the channel config defaults (`channels.max.notify` /
+ * `disableLinkPreview`). Unset fields are omitted — the MAX server default
+ * (notify on, link preview on) applies.
+ */
+export function resolveMaxSendOptions(
+  cfg: OpenClawConfig,
+  channelData?: unknown,
+): { notify?: boolean; disable_link_preview?: boolean } {
+  const section = (cfg.channels as Record<string, any>)?.[MAX_CHANNEL_ID] ?? {};
+  const cd =
+    channelData && typeof channelData === "object" && !Array.isArray(channelData)
+      ? (channelData as Record<string, unknown>)
+      : {};
+  const notify =
+    typeof cd.maxNotify === "boolean"
+      ? cd.maxNotify
+      : typeof section.notify === "boolean"
+        ? section.notify
+        : undefined;
+  const disableLinkPreview =
+    typeof cd.maxDisableLinkPreview === "boolean"
+      ? cd.maxDisableLinkPreview
+      : typeof section.disableLinkPreview === "boolean"
+        ? section.disableLinkPreview
+        : undefined;
+  return {
+    ...(notify !== undefined ? { notify } : {}),
+    ...(disableLinkPreview !== undefined ? { disable_link_preview: disableLinkPreview } : {}),
+  };
 }
 
 // Inbound updates are processed by the handler registered from the plugin
@@ -385,6 +499,9 @@ export const maxPlugin = createChatChannelPlugin<ResolvedAccount, MaxProbe>({
         'Delete your own message: message(action="delete", messageId="<mid>") — no time limit.',
         'Pin/unpin: message(action="pin", target="<chat_id>", messageId="<mid>", notify=false) /',
         'message(action="unpin", target="<chat_id>").',
+        "Per-message options on replies: channelData.maxNotify=false (silent),",
+        "channelData.maxDisableLinkPreview=true; channel defaults: channels.max.notify /",
+        "disableLinkPreview. Image URLs are attached by link (no re-upload).",
       ],
       inboundFormattingHints: () => ({
         text_markup: "markdown",
@@ -407,6 +524,23 @@ export const maxPlugin = createChatChannelPlugin<ResolvedAccount, MaxProbe>({
       resolveAccount,
       listAccountIds(cfg) {
         return [DEFAULT_ACCOUNT_ID];
+      },
+      // Diagnostics for `openclaw status` — never leaks the token itself.
+      inspectAccount: (cfg, accountId) => {
+        const section = (cfg.channels as Record<string, any>)?.[MAX_CHANNEL_ID] ?? {};
+        const account = resolveAccount(cfg, accountId);
+        return {
+          accountId: account.accountId ?? DEFAULT_ACCOUNT_ID,
+          enabled: account.enabled,
+          configured: account.configured,
+          tokenSource: account.token ? ("config" as const) : ("none" as const),
+          tokenPreview: maskMaxToken(account.token),
+          dmPolicy: account.dmPolicy ?? "allowlist",
+          groupPolicy: section.groupPolicy ?? "open",
+          webhook: account.webhookUrl ? "webhook" : "polling",
+          streaming: section.streaming !== false,
+          httpProxy: Boolean(account.httpProxy),
+        };
       },
     },
     status: createComputedAccountStatusAdapter<ResolvedAccount, MaxProbe>({
@@ -441,26 +575,14 @@ export const maxPlugin = createChatChannelPlugin<ResolvedAccount, MaxProbe>({
     },
   },
 
-  // Pairing: approval flow for new DM contacts
+  // Pairing: approval flow for new DM contacts. The challenge code itself is
+  // sent by the inbound gate (index.ts issueChallenge → sendPairingReply);
+  // notifyApproval fires after `openclaw pairing approve --notify`.
   pairing: {
-    text: {
-      idLabel: "MAX user ID",
-      message: "Send this code to verify your identity:",
-      notify: async (params: {
-        cfg: OpenClawConfig;
-        id: string;
-        accountId?: string;
-        runtime?: any;
-        message: string;
-      }) => {
-        if (botInstance) {
-          await botInstance.api.sendMessageToUser(
-            Number(normalizeMaxTarget(params.id).replace(/^user:/i, "")),
-            params.message,
-            { format: "markdown" }
-          );
-        }
-      },
+    idLabel: "MAX user ID",
+    notifyApproval: async (params) => {
+      if (!botInstance) return;
+      await sendMaxPairingApproval(botInstance, params.id);
     },
   },
 
@@ -476,7 +598,10 @@ export const maxPlugin = createChatChannelPlugin<ResolvedAccount, MaxProbe>({
       channel: MAX_CHANNEL_ID,
       sendText: async (params) => {
         const bot = ensureBotForOutbound(params.cfg);
-        const sent = await sendMaxMessage(bot, params.to, params.text, { format: "markdown" });
+        const opts = resolveMaxSendOptions(params.cfg);
+        // The core's `silent` flag maps to MAX notify=false.
+        if (params.silent === true) opts.notify = false;
+        const sent = await sendMaxMessage(bot, params.to, params.text, { format: "markdown", ...opts });
         return { messageId: extractSentMessageId(sent) };
       },
       sendMedia: async (params) => {
@@ -485,32 +610,17 @@ export const maxPlugin = createChatChannelPlugin<ResolvedAccount, MaxProbe>({
         if (!mediaUrl) {
           throw new Error("mediaUrl is required");
         }
-        let data: Buffer;
-        let filename: string;
-        let contentType: string | undefined;
-        if (/^https?:\/\//i.test(mediaUrl)) {
-          // SSRF-guarded download; scoped MAX fetch (CA/proxy) stays in effect
-          const fetched = await downloadRemoteMedia({ url: mediaUrl, fetchImpl: getMaxFetch() });
-          data = fetched.buffer;
-          filename =
-            decodeURIComponent(new URL(mediaUrl).pathname.split("/").pop() ?? "") || "file";
-          contentType = fetched.contentType || undefined;
-        } else {
-          // Local paths only via the host reader or inside the allowed media
-          // roots — otherwise an agent-named path could exfiltrate any file.
-          data = await readLocalMedia(mediaUrl, {
-            mediaReadFile: params.mediaReadFile,
-            mediaLocalRoots:
-              params.mediaLocalRoots ?? getAgentScopedMediaLocalRoots(params.cfg),
-          });
-          filename = mediaUrl.split("/").pop() || "file";
-        }
-        const uploadType = resolveMaxUploadType(filename, contentType);
-        const attachment = await rawUploadMaxMedia(bot, uploadType, data, filename);
-        const sent = await sendMaxMessage(bot, params.to, params.text ?? "", {
-          attachments: [attachment as any],
+        const opts = resolveMaxSendOptions(params.cfg);
+        if (params.silent === true) opts.notify = false;
+        const messageId = await sendMaxMedia(bot, {
+          to: params.to,
+          text: params.text,
+          mediaUrl,
+          mediaReadFile: params.mediaReadFile,
+          mediaLocalRoots: params.mediaLocalRoots ?? getAgentScopedMediaLocalRoots(params.cfg),
+          extra: opts,
         });
-        return { messageId: extractSentMessageId(sent) };
+        return { messageId };
       },
     },
   },

@@ -1,7 +1,7 @@
 import { timingSafeEqual } from "node:crypto";
 import { defineChannelPluginEntry } from "openclaw/plugin-sdk/channel-core";
 import { createTypingCallbacks } from "openclaw/plugin-sdk/channel-reply-pipeline";
-import { getBot, getMaxFetch, maxPlugin, normalizeMaxTarget, runOutsideInheritedRootWork, setMaxUpdateHandler, resolveGroupPolicyWarning, DEFAULT_ACCOUNT_ID, MAX_CHANNEL_ID } from "./channel.js";
+import { getBot, getMaxFetch, maxPlugin, normalizeMaxTarget, runOutsideInheritedRootWork, setMaxUpdateHandler, resolveGroupPolicyWarning, resolveMaxSendOptions, DEFAULT_ACCOUNT_ID, MAX_CHANNEL_ID } from "./channel.js";
 import {
   resolveReplyKeyboardButtons,
   toInlineKeyboardAttachment,
@@ -366,6 +366,26 @@ async function buildTextAndMedia(
       continue;
     }
 
+    // Share: forwarded post/contact cards carry a title and/or payload.url.
+    if (att?.type === "share") {
+      const title = typeof att?.title === "string" ? att.title : "";
+      const shareUrl = typeof att?.payload?.url === "string" ? att.payload.url : "";
+      const label = title && shareUrl ? `${title} (${shareUrl})` : title || shareUrl;
+      const marker = `[Shared${label ? `: ${label}` : ""}]`;
+      text = text ? `${text}\n${marker}` : marker;
+      continue;
+    }
+
+    // Anything else we cannot render: tell the agent something arrived instead
+    // of dropping it silently.
+    const knownMediaType =
+      att?.type === "image" || att?.type === "video" || att?.type === "audio" || att?.type === "file";
+    if (att?.type && !knownMediaType) {
+      const marker = `[Unsupported attachment: ${att.type}]`;
+      text = text ? `${text}\n${marker}` : marker;
+      continue;
+    }
+
     let url =
       att?.payload?.url ?? (Array.isArray(att?.payload?.ls) ? att.payload.ls[0] : undefined);
     if (!url && att?.type === "video" && att?.payload?.token) {
@@ -654,6 +674,9 @@ async function runInbound(api: OpenClawPluginApi, facts: InboundFacts, token: st
                   const keyboardAttachment = keyboardButtons
                     ? toInlineKeyboardAttachment(keyboardButtons)
                     : undefined;
+                  // Per-message send options: channelData.maxNotify /
+                  // maxDisableLinkPreview override the channel config defaults.
+                  const sendOpts = resolveMaxSendOptions(cfg, payload?.channelData);
                   if (draft.mid) {
                     // The draft exists: edit it into the authoritative final text
                     // (no cursor), then send any overflow chunks as new messages.
@@ -669,9 +692,9 @@ async function runInbound(api: OpenClawPluginApi, facts: InboundFacts, token: st
                     for (const chunk of chunks.slice(1)) {
                       let sent;
                       try {
-                        sent = await sendReplyMessage(bot, chunk, { format: "markdown" });
+                        sent = await sendReplyMessage(bot, chunk, { format: "markdown", ...sendOpts });
                       } catch {
-                        sent = await sendReplyMessage(bot, chunk);
+                        sent = await sendReplyMessage(bot, chunk, { ...sendOpts });
                       }
                       const mid = extractMid(sent);
                       if (mid) messageIds.push(mid);
@@ -690,11 +713,13 @@ async function runInbound(api: OpenClawPluginApi, facts: InboundFacts, token: st
                     try {
                       sent = await sendReplyMessage(bot, chunk, {
                         format: "markdown",
+                        ...sendOpts,
                         ...(attachments ? { attachments } : {}),
                       });
                     } catch {
                       // invalid markdown must not lose the reply
                       sent = await sendReplyMessage(bot, chunk, {
+                        ...sendOpts,
                         ...(attachments ? { attachments } : {}),
                       });
                     }

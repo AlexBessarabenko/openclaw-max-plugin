@@ -43,6 +43,8 @@
             "items": { "type": "string" }
           },
           "requireMention": { "type": "boolean" },
+          "notify": { "type": "boolean" },
+          "disableLinkPreview": { "type": "boolean" },
           "groups": {
             "type": "object",
             "additionalProperties": {
@@ -77,6 +79,12 @@
         },
         "streaming": {
           "label": "Stream replies via message edits (default: on)"
+        },
+        "notify": {
+          "label": "Notify recipients on outbound messages (default: on). Per-message override: channelData.maxNotify"
+        },
+        "disableLinkPreview": {
+          "label": "Suppress link previews in outbound messages (default: off). Per-message override: channelData.maxDisableLinkPreview"
         }
       }
     }

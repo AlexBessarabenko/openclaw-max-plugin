@@ -160,6 +160,55 @@ describe("inbound location", () => {
   });
 });
 
+describe("inbound share / unsupported attachments", () => {
+  it("renders a share card as a [Shared: title (url)] marker", async () => {
+    const { api, captured } = makeApi();
+    await handleUpdate(
+      api as any,
+      messageWithAttachments("m-sh-1", [
+        { type: "share", title: "Пост канала", payload: { url: "https://max.ru/c/123" } },
+      ]),
+      "tok",
+    );
+    expect(captured.turn.ctxPayload.message.body).toBe(
+      "[Shared: Пост канала (https://max.ru/c/123)]",
+    );
+  });
+
+  it("keeps the message text alongside the share marker", async () => {
+    const { api, captured } = makeApi();
+    await handleUpdate(
+      api as any,
+      messageWithAttachments(
+        "m-sh-2",
+        [{ type: "share", payload: { url: "https://max.ru/c/9" } }],
+        "глянь",
+      ),
+      "tok",
+    );
+    expect(captured.turn.ctxPayload.message.body).toBe(
+      "глянь\n[Shared: https://max.ru/c/9]",
+    );
+  });
+
+  it("marks unknown attachment types instead of dropping them silently", async () => {
+    const { api, captured } = makeApi();
+    await handleUpdate(
+      api as any,
+      messageWithAttachments(
+        "m-un-1",
+        [{ type: "inline_keyboard", payload: { buttons: [] } }, { type: "some_future_type" }],
+        "текст не теряется",
+      ),
+      "tok",
+    );
+    const text = captured.turn.ctxPayload.message.body;
+    expect(text).toContain("текст не теряется");
+    expect(text).toContain("[Unsupported attachment: inline_keyboard]");
+    expect(text).toContain("[Unsupported attachment: some_future_type]");
+  });
+});
+
 describe("inbound contact", () => {
   it("extracts the name from the VCard payload", async () => {
     const { api, captured } = makeApi();
