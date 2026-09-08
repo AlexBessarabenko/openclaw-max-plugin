@@ -1,8 +1,12 @@
 import { timingSafeEqual } from "node:crypto";
 import { defineChannelPluginEntry } from "openclaw/plugin-sdk/channel-core";
 import { createTypingCallbacks } from "openclaw/plugin-sdk/channel-reply-pipeline";
-import { getBot, getMaxFetch, maxPlugin, runOutsideInheritedRootWork, setMaxUpdateHandler, DEFAULT_ACCOUNT_ID, MAX_CHANNEL_ID } from "./channel.js";
+import { getBot, getMaxFetch, maxPlugin, normalizeMaxTarget, runOutsideInheritedRootWork, setMaxUpdateHandler, DEFAULT_ACCOUNT_ID, MAX_CHANNEL_ID } from "./channel.js";
 import { resolveReplyKeyboardButtons, toInlineKeyboardAttachment, } from "./src/keyboards.js";
+import { downloadRemoteMedia, MAX_ATTACHMENT_BYTES, MAX_INBOUND_ATTACHMENTS, } from "./src/media-access.js";
+import { createMaxSendFileTool } from "./src/send-file-tool.js";
+import { resolveDmGroupAccessWithLists } from "openclaw/plugin-sdk/channel-policy";
+import { createChannelPairingController } from "openclaw/plugin-sdk/channel-pairing";
 /** MAX caps message text at 4000 chars. */
 const MAX_TEXT_LIMIT = 4000;
 // Deduplication: messageId → timestamp (TTL 5 min)
@@ -159,10 +163,14 @@ function attachmentNeedsAuth(url) {
 }
 async function downloadAttachment(url, token) {
     const headers = token && attachmentNeedsAuth(url) ? { Authorization: `Bearer ${token}` } : undefined;
-    const resp = await getMaxFetch()(url, headers ? { headers } : undefined);
-    if (!resp.ok)
-        throw new Error(`download failed: HTTP ${resp.status}`);
-    return Buffer.from(await resp.arrayBuffer());
+    // SSRF-guarded; the size limit is enforced before/while buffering.
+    const { buffer } = await downloadRemoteMedia({
+        url,
+        fetchImpl: getMaxFetch(),
+        headers,
+        maxBytes: MAX_ATTACHMENT_BYTES,
+    });
+    return buffer;
 }
 /**
  * Transcribe a saved audio file through the core media-understanding pipeline.
@@ -188,7 +196,11 @@ async function buildTextAndMedia(api, facts, token) {
     const rt = api.runtime?.channel;
     const media = [];
     let text = facts.text;
-    for (const att of facts.attachments ?? []) {
+    const attachments = facts.attachments ?? [];
+    if (attachments.length > MAX_INBOUND_ATTACHMENTS) {
+        api.logger.warn(`[MAX] message has ${attachments.length} attachments, only the first ${MAX_INBOUND_ATTACHMENTS} are processed`);
+    }
+    for (const att of attachments.slice(0, MAX_INBOUND_ATTACHMENTS)) {
         const url = att?.payload?.url ?? (Array.isArray(att?.payload?.ls) ? att.payload.ls[0] : undefined);
         if (!url)
             continue;
@@ -509,6 +521,68 @@ async function runInbound(api, facts, token) {
         },
     });
 }
+/**
+ * DM access gate — runs BEFORE any attachment download or disk write, so a
+ * blocked sender cannot make the plugin fetch or store anything. Group chats
+ * are not gated here (group policy is a separate surface). Config policies map
+ * onto the SDK vocabulary: "closed" → "disabled"; unset → "allowlist"
+ * (matches the security.dm defaultPolicy the plugin reports to core).
+ */
+async function checkDmAccess(api, facts) {
+    if (facts.isGroup)
+        return true;
+    const rt = api.runtime;
+    const cfg = rt?.config?.current?.() ?? api.config ?? {};
+    const section = cfg?.channels?.[MAX_CHANNEL_ID] ?? {};
+    const rawPolicy = section.dmPolicy ?? "allowlist";
+    const dmPolicy = rawPolicy === "closed" ? "disabled" : rawPolicy;
+    if (dmPolicy === "open")
+        return true;
+    let storeAllowFrom = [];
+    try {
+        storeAllowFrom =
+            (await rt?.channel?.pairing?.readAllowFromStore?.({
+                channel: MAX_CHANNEL_ID,
+                accountId: DEFAULT_ACCOUNT_ID,
+            })) ?? [];
+    }
+    catch (err) {
+        api.logger.warn(`[MAX] pairing allowlist read failed: ${err?.message ?? err}`);
+    }
+    const { decision, reason } = resolveDmGroupAccessWithLists({
+        isGroup: false,
+        dmPolicy,
+        allowFrom: section.allowFrom ?? [],
+        storeAllowFrom,
+        isSenderAllowed: (allowFrom) => allowFrom.some((entry) => normalizeMaxTarget(String(entry)).replace(/^user:/i, "") === String(facts.senderId)),
+    });
+    if (decision === "allow")
+        return true;
+    api.logger.info(`[MAX] inbound dropped by dmPolicy=${rawPolicy}: ${reason} (sender=${facts.senderId})`);
+    if (decision === "pairing") {
+        try {
+            const pairing = createChannelPairingController({
+                core: rt,
+                channel: MAX_CHANNEL_ID,
+                accountId: DEFAULT_ACCOUNT_ID,
+            });
+            const bot = getBot();
+            await pairing.issueChallenge({
+                senderId: String(facts.senderId),
+                senderIdLine: `maxUserId: ${facts.senderId}`,
+                sendPairingReply: async (text) => {
+                    if (bot) {
+                        await bot.api.sendMessageToUser(Number(facts.senderId), text, { format: "markdown" });
+                    }
+                },
+            });
+        }
+        catch (err) {
+            api.logger.warn(`[MAX] pairing challenge failed: ${err?.message ?? err}`);
+        }
+    }
+    return false;
+}
 /** Shared update handler for webhook and polling transports. */
 export async function handleUpdate(api, update, token) {
     const facts = extractInboundFacts(update);
@@ -535,6 +609,10 @@ export async function handleUpdate(api, update, token) {
             }
         }
     }
+    // Access gate BEFORE any download, session record or last-route write: a
+    // blocked sender causes zero fetches and zero disk writes.
+    if (!(await checkDmAccess(api, facts)))
+        return;
     await runInbound(api, facts, token);
 }
 export default defineChannelPluginEntry({
@@ -566,6 +644,10 @@ export default defineChannelPluginEntry({
         // The channel gateway lifecycle (gateway.startAccount) owns bot startup;
         // here we expose the inbound handler and the webhook HTTP route.
         setMaxUpdateHandler((update, handlerToken) => handleUpdate(api, update, handlerToken));
+        // Agent tool: send a file into the current MAX chat. Registered as a
+        // factory so the per-run tool context (delivery route, agent, workspace)
+        // is captured fresh for each session.
+        api.registerTool((toolCtx) => createMaxSendFileTool(toolCtx));
         // --- Webhook handler ---
         api.registerHttpRoute({
             path: "/max/webhook",

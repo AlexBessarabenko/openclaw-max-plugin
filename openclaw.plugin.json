@@ -7,6 +7,9 @@
   "activation": {
     "onStartup": true
   },
+  "contracts": {
+    "tools": ["max_send_file"]
+  },
   "configSchema": {
     "type": "object",
     "additionalProperties": false,

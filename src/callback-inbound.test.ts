@@ -38,7 +38,7 @@ function makeApi(): { api: any; captured: Captured } {
   const api = {
     logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
     runtime: {
-      config: { current: () => ({}) },
+      config: { current: () => ({ channels: { max: { dmPolicy: "open" } } }) },
       channel: {
         routing: {
           resolveAgentRoute: () => ({
@@ -53,6 +53,9 @@ function makeApi(): { api: any; captured: Captured } {
         session: {
           resolveStorePath: () => "/store/agent",
           recordInboundSession: vi.fn(),
+        },
+        pairing: {
+          readAllowFromStore: vi.fn(async () => []),
         },
         inbound: {
           run: vi.fn(async (args: any) => {

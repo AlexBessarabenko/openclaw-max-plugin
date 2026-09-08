@@ -1,3 +1,4 @@
+import type { OpenClawConfig } from "openclaw/plugin-sdk/channel-core";
 import type { ChannelMessagingAdapter } from "openclaw/plugin-sdk/core";
 import { Bot } from "@maxhub/max-bot-api";
 export declare const MAX_CHANNEL_ID = "max";
@@ -24,6 +25,7 @@ export declare function stripMaxTarget(target: string): string;
  * NOT a chat id: sending it via chat_id fails with 404).
  */
 export declare function normalizeMaxTarget(raw: string): string;
+export declare function sendMaxMessage(bot: Bot, to: string, text: string, extra?: Record<string, unknown>): Promise<any>;
 /**
  * Target adapter for the `message` tool and `openclaw message send --channel max`.
  *
@@ -39,6 +41,19 @@ export declare function normalizeMaxTarget(raw: string): string;
  * directly, use the explicit `user:<id>` form (sent via sendMessageToUser).
  */
 export declare const maxMessaging: ChannelMessagingAdapter;
+type MaxUploadType = "image" | "video" | "audio" | "file";
+export declare function resolveMaxUploadType(filename?: string, contentType?: string): MaxUploadType;
+/**
+ * Upload media through the raw uploads endpoint instead of the SDK helpers:
+ * max-bot-api 0.2.5 drops the upload token on the Buffer path and never reads
+ * it back from the multipart response. The token arrives either in the
+ * getUploadUrl response (range-upload flow: video/audio/file) or in the upload
+ * response JSON ("photos" map for image uploads, "token" otherwise).
+ */
+export declare function rawUploadMaxMedia(bot: Bot, type: MaxUploadType, data: Buffer, filename: string): Promise<{
+    type: MaxUploadType;
+    payload: Record<string, unknown>;
+}>;
 /** Scoped fetch for direct calls outside bot init (probes, attachment downloads). */
 export declare function getMaxFetch(): (input: any, init?: any) => Promise<any>;
 type InboundUpdateHandler = (update: any, token: string) => Promise<void>;
@@ -66,5 +81,12 @@ type MaxProbe = {
 export declare const maxPlugin: import("openclaw/plugin-sdk/channel-core").ChannelPlugin<ResolvedAccount, MaxProbe, unknown>;
 export declare function initializeBot(token: string, apiBaseUrl?: string, httpProxy?: string): Bot;
 export declare function getBot(): Bot | null;
+/**
+ * Outbound sends also run outside the gateway lifecycle (e.g. the
+ * `openclaw message send` CLI loads the plugin in-process), where
+ * `initializeBot` was never called. Fall back to a send-only client built
+ * from the configured token; `Bot` only starts polling on `.startPolling()`.
+ */
+export declare function ensureBotForOutbound(cfg: OpenClawConfig): Bot;
 export {};
 //# sourceMappingURL=channel.d.ts.map

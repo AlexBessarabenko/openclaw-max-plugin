@@ -32,6 +32,8 @@
     "certs.ts",
     "setup-entry.ts",
     "src/keyboards.ts",
+    "src/media-access.ts",
+    "src/send-file-tool.ts",
     "openclaw.plugin.json",
     "README.md",
     "LICENSE"

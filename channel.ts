@@ -7,6 +7,8 @@ import { buildProbeChannelStatusSummary } from "openclaw/plugin-sdk/channel-stat
 import { createComputedAccountStatusAdapter, createDefaultChannelRuntimeState } from "openclaw/plugin-sdk/status-helpers";
 import { Bot } from "@maxhub/max-bot-api";
 import { createMaxScopedFetch } from "./certs.js";
+import { getAgentScopedMediaLocalRoots } from "openclaw/plugin-sdk/media-runtime";
+import { downloadRemoteMedia, readLocalMedia } from "./src/media-access.js";
 
 export const MAX_CHANNEL_ID = "max";
 export const DEFAULT_ACCOUNT_ID = "default";
@@ -88,7 +90,7 @@ function resolveSendTarget(to: string): { userId: number } | { chatId: number } 
   return { chatId: Number(t) };
 }
 
-async function sendMaxMessage(
+export async function sendMaxMessage(
   bot: Bot,
   to: string,
   text: string,
@@ -151,7 +153,7 @@ const IMAGE_EXTS = new Set(["png", "jpg", "jpeg", "gif", "webp"]);
 const VIDEO_EXTS = new Set(["mp4", "mov", "avi", "webm", "mkv"]);
 const AUDIO_EXTS = new Set(["mp3", "ogg", "wav", "m4a", "opus"]);
 
-function resolveMaxUploadType(filename?: string, contentType?: string): MaxUploadType {
+export function resolveMaxUploadType(filename?: string, contentType?: string): MaxUploadType {
   const ext = filename?.split(".").pop()?.toLowerCase() ?? "";
   if (contentType?.startsWith("image/") || IMAGE_EXTS.has(ext)) return "image";
   if (contentType?.startsWith("video/") || VIDEO_EXTS.has(ext)) return "video";
@@ -166,7 +168,7 @@ function resolveMaxUploadType(filename?: string, contentType?: string): MaxUploa
  * getUploadUrl response (range-upload flow: video/audio/file) or in the upload
  * response JSON ("photos" map for image uploads, "token" otherwise).
  */
-async function rawUploadMaxMedia(
+export async function rawUploadMaxMedia(
   bot: Bot,
   type: MaxUploadType,
   data: Buffer,
@@ -391,17 +393,20 @@ export const maxPlugin = createChatChannelPlugin<ResolvedAccount, MaxProbe>({
         let filename: string;
         let contentType: string | undefined;
         if (/^https?:\/\//i.test(mediaUrl)) {
-          const res = await fetch(mediaUrl);
-          if (!res.ok) throw new Error(`failed to fetch media: HTTP ${res.status}`);
-          data = Buffer.from(await res.arrayBuffer());
+          // SSRF-guarded download; scoped MAX fetch (CA/proxy) stays in effect
+          const fetched = await downloadRemoteMedia({ url: mediaUrl, fetchImpl: getMaxFetch() });
+          data = fetched.buffer;
           filename =
             decodeURIComponent(new URL(mediaUrl).pathname.split("/").pop() ?? "") || "file";
-          contentType = res.headers.get("content-type") ?? undefined;
+          contentType = fetched.contentType || undefined;
         } else {
-          if (!params.mediaReadFile) {
-            throw new Error("local media is not readable in this context");
-          }
-          data = Buffer.from(await params.mediaReadFile(mediaUrl));
+          // Local paths only via the host reader or inside the allowed media
+          // roots — otherwise an agent-named path could exfiltrate any file.
+          data = await readLocalMedia(mediaUrl, {
+            mediaReadFile: params.mediaReadFile,
+            mediaLocalRoots:
+              params.mediaLocalRoots ?? getAgentScopedMediaLocalRoots(params.cfg),
+          });
           filename = mediaUrl.split("/").pop() || "file";
         }
         const uploadType = resolveMaxUploadType(filename, contentType);
@@ -448,7 +453,7 @@ export function getBot(): Bot | null {
  * `initializeBot` was never called. Fall back to a send-only client built
  * from the configured token; `Bot` only starts polling on `.startPolling()`.
  */
-function ensureBotForOutbound(cfg: OpenClawConfig): Bot {
+export function ensureBotForOutbound(cfg: OpenClawConfig): Bot {
   if (botInstance) return botInstance;
   const account = resolveAccount(cfg, DEFAULT_ACCOUNT_ID);
   if (!account.token) throw new Error("MAX token is not configured");
