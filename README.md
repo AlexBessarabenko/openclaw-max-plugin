@@ -26,6 +26,7 @@ Tested with OpenClaw **2026.9.2**, MAX Bot API v2 (`platform-api2.max.ru`).
 - ✅ **Streaming replies** — partial model output edits a single draft message in place (`editMessage`), final text replaces it; can be disabled
 - ✅ **Scoped HTTP proxy** — optional per-account proxy for MAX API traffic only, without touching the rest of the gateway
 - ✅ **Agent prompt hints** — the plugin teaches the agent MAX Markdown rules, the 4000-char limit and delivery-target syntax via `agentPrompt`
+- ✅ **Inline keyboards** — the agent attaches buttons via `channelData.maxInlineKeyboard`; button presses arrive as inbound messages and are auto-acknowledged
 
 ## Installation
 
@@ -197,6 +198,38 @@ message and keeps editing it in place (throttled, `format: "markdown"`); the fin
 replaces the draft text. Long final answers are still chunked at 4000 chars — the first
 chunk edits the draft, the rest arrive as follow-up messages. Set
 `channels.max.streaming: false` to restore the old send-once behavior.
+
+### Inline keyboards (buttons)
+
+Since **0.5.0** the agent can attach inline keyboards to the final reply and react to
+button presses. Pass buttons via the `message` tool's `channelData.maxInlineKeyboard`
+(one inner array = one row):
+
+```json
+{
+  "channelData": {
+    "maxInlineKeyboard": [
+      [{ "text": "Да", "payload": "vote:yes" }, "Нет"],
+      [{ "text": "Открыть", "url": "https://dev.max.ru" }]
+    ]
+  }
+}
+```
+
+- Simplified `{text, url?, payload?}` (and plain strings — payload = label) or full wire
+  buttons `{type: "callback"|"link"|"clipboard", …}`; URL buttons win over payload.
+- MAX limits enforced by validation: ≤ **210** buttons, ≤ **30** rows, ≤ **7** buttons
+  per row (≤ **3** when the row contains a `link`-type button), link URL ≤ **2048** chars.
+- The keyboard rides only the **final** message (a streaming draft is edited into the
+  final text with the keyboard attached; long replies carry it on the last chunk).
+- Invalid keyboards are logged and dropped — the text reply still goes out.
+- `message_callback` updates arrive as regular inbound messages carrying the button
+  payload as text; the callback is auto-acknowledged (`POST /answers`), so no spinner
+  is left hanging on the button. Make payloads self-describing — MAX does not echo the
+  button label.
+- **Reply-path only:** keyboards are delivered only on the agent's reply path. The
+  durable path (`openclaw message send --channel max …`) does not carry `channelData`,
+  so no keyboard can be attached there.
 
 ### HTTP proxy
 

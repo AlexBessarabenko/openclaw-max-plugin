@@ -1,3 +1,6 @@
+import type { OpenClawPluginApi } from "openclaw/plugin-sdk/channel-core";
+/** Shared update handler for webhook and polling transports. */
+export declare function handleUpdate(api: OpenClawPluginApi, update: any, token: string): Promise<void>;
 declare const _default: {
     id: string;
     name: string;

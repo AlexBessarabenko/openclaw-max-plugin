@@ -280,6 +280,16 @@ export const maxPlugin = createChatChannelPlugin<ResolvedAccount, MaxProbe>({
         "Delivery target: dialog chat id (positive) or `user:<user_id>` for DMs;",
         "group/channel ids are negative.",
         "Attach media via the message tool `media` param (local path or URL).",
+        "Inline keyboards: pass `channelData.maxInlineKeyboard` on the message tool —",
+        "an array of rows, each row an array of buttons `{text, url?, payload?}`",
+        "(url → link button, otherwise callback; payload defaults to the label) or",
+        "plain strings (callback with payload = text). Full wire buttons",
+        "`{type: \"callback\"|\"link\"|\"clipboard\", ...}` are accepted too.",
+        "Limits: ≤210 buttons, ≤30 rows, ≤7 per row (≤3 if a row has a link),",
+        "link URL ≤2048 chars. The keyboard attaches to the final reply only,",
+        "on the reply path (not via `openclaw message send`); a button press",
+        "returns as an inbound message carrying the payload (plus a quote of",
+        "the message the button was on) — make payloads self-describing.",
       ],
       inboundFormattingHints: () => ({
         text_markup: "markdown",
@@ -477,7 +487,7 @@ async function runMaxAccount(ctx: ChannelGatewayContext<ResolvedAccount>): Promi
         headers: { "content-type": "application/json", Authorization: account.token },
         body: JSON.stringify({
           url: account.webhookUrl,
-          update_types: ["message_created", "bot_started"],
+          update_types: ["message_created", "message_callback", "bot_started"],
           ...(account.webhookSecret ? { secret: account.webhookSecret } : {}),
         }),
       });
@@ -519,6 +529,16 @@ async function runMaxAccount(ctx: ChannelGatewayContext<ResolvedAccount>): Promi
         log?.error("[MAX] polling update failed: " + (err?.message ?? err));
       }
     });
+    bot.on("message_callback", async (botCtx: any) => {
+      try {
+        await handler(
+          botCtx.update ?? { update_type: "message_callback", callback: botCtx.callback },
+          account.token,
+        );
+      } catch (err: any) {
+        log?.error("[MAX] message_callback handling failed: " + (err?.message ?? err));
+      }
+    });
     bot.on("bot_started", async (botCtx: any) => {
       try {
         await handler(botCtx.update ?? botCtx, account.token);
@@ -548,7 +568,7 @@ async function runMaxAccount(ctx: ChannelGatewayContext<ResolvedAccount>): Promi
     const supervise = (async () => {
       while (!ctx.abortSignal?.aborted) {
         const startedAt = Date.now();
-        await bot.startPolling({ allowedUpdates: ["message_created", "bot_started"] });
+        await bot.startPolling({ allowedUpdates: ["message_created", "message_callback", "bot_started"] });
         if (ctx.abortSignal?.aborted) break;
         if (Date.now() - startedAt > HEALTHY_RUN_MS) restartDelayMs = MIN_RESTART_DELAY_MS;
         const waitMs = Math.round(restartDelayMs * (0.5 + Math.random()));

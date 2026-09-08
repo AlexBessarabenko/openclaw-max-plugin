@@ -2,6 +2,11 @@ import { timingSafeEqual } from "node:crypto";
 import { defineChannelPluginEntry } from "openclaw/plugin-sdk/channel-core";
 import { createTypingCallbacks } from "openclaw/plugin-sdk/channel-reply-pipeline";
 import { getBot, getMaxFetch, maxPlugin, runOutsideInheritedRootWork, setMaxUpdateHandler, DEFAULT_ACCOUNT_ID, MAX_CHANNEL_ID } from "./channel.js";
+import {
+  resolveReplyKeyboardButtons,
+  toInlineKeyboardAttachment,
+  type MaxInlineKeyboardAttachment,
+} from "./src/keyboards.js";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk/channel-core";
 
 /** MAX caps message text at 4000 chars. */
@@ -42,6 +47,14 @@ type InboundFacts = {
   isGroup: boolean;
   timestamp?: number;
   attachments?: any[];
+  /** Present on message_callback: id for POST /answers acknowledgement. */
+  callbackId?: string;
+  /**
+   * Full delivery target override (`max:…`) for the reply path. Set on
+   * message_callback without a source message: the bare user id is not a chat
+   * id (replying into it 404s), so the reply must go to `max:user:<id>`.
+   */
+  replyTarget?: string;
 };
 
 /** Normalize a raw MAX update (webhook or polling) into inbound facts. */
@@ -116,6 +129,42 @@ function extractInboundFacts(update: any): InboundFacts | null {
       chatId: String(chatId),
       isGroup: false,
       timestamp: update.timestamp,
+    };
+  }
+
+  // Inline keyboard button press: synthesize a regular inbound message from the
+  // callback payload (donor `processCallback` pattern). The button label is not
+  // echoed by MAX — agents receive the payload, so button payloads should be
+  // self-describing (plain strings become payload=text in the send path). The
+  // text of the message the button was attached to usually is echoed, so it is
+  // quoted after the payload to give the agent the context of the press.
+  if (type === "message_callback") {
+    const cb = update.callback;
+    if (!cb?.user?.user_id || !cb.callback_id) return null;
+    const payload = typeof cb.payload === "string" ? cb.payload : "";
+    if (!payload.trim()) return null;
+    const user = cb.user;
+    const msgChatId =
+      update.message?.recipient?.chat_id ?? update.message?.chat_id ?? update.chat_id;
+    const chatId = msgChatId ?? user.user_id;
+    const sourceText =
+      typeof update.message?.body?.text === "string"
+        ? update.message.body.text.replace(/\s+/g, " ").trim()
+        : "";
+    const clipped = sourceText.length > 200 ? `${sourceText.slice(0, 199)}…` : sourceText;
+    const text = clipped ? `${payload}\n[Button on: "${clipped}"]` : payload;
+    return {
+      messageId: `callback:${cb.callback_id}`,
+      text,
+      senderId: String(user.user_id),
+      senderName:
+        user.name || [user.first_name, user.last_name].filter(Boolean).join(" ") || "Unknown",
+      senderIsBot: Boolean(user.is_bot),
+      chatId: String(chatId),
+      replyTarget: msgChatId != null ? undefined : `max:user:${user.user_id}`,
+      isGroup: (update.message?.recipient?.chat_type ?? "dialog") !== "dialog",
+      timestamp: cb.timestamp,
+      callbackId: cb.callback_id,
     };
   }
 
@@ -323,7 +372,7 @@ async function runInbound(api: OpenClawPluginApi, facts: InboundFacts, token: st
             routeSessionKey: sessionKey,
             mainSessionKey: route.mainSessionKey,
           },
-          reply: { to: `max:${chatId}` },
+          reply: { to: facts.replyTarget ?? `max:${chatId}` },
           message: {
             inboundEventKind: "user_request",
             rawBody: text,
@@ -337,10 +386,26 @@ async function runInbound(api: OpenClawPluginApi, facts: InboundFacts, token: st
 
         const sendTyping = async () => {
           const bot = getBot();
-          if (bot) {
+          // sendAction needs a real chat id — no chat exists on the user-target path
+          if (bot && replyUserId == null) {
             await bot.api.sendAction(Number(chatId), "typing_on");
           }
         };
+
+        // message_callback without a source message: there is no chat to reply
+        // into (the bare user id as chat_id 404s), so answer the user directly.
+        const replyUserId =
+          facts.replyTarget != null
+            ? Number(facts.replyTarget.replace(/^max:user:/i, ""))
+            : null;
+        const sendReplyMessage = (
+          bot: NonNullable<ReturnType<typeof getBot>>,
+          text: string,
+          extra?: Record<string, unknown>,
+        ): Promise<any> =>
+          replyUserId != null
+            ? bot.api.sendMessageToUser(replyUserId, text, extra as any)
+            : bot.api.sendMessageToChat(Number(chatId), text, extra as any);
 
         // --- Draft streaming: cumulative partial replies edit one draft message ---
         const streamingEnabled = (cfg.channels as any)?.[MAX_CHANNEL_ID]?.streaming !== false;
@@ -355,16 +420,24 @@ async function runInbound(api: OpenClawPluginApi, facts: InboundFacts, token: st
           const mid = sent?.message?.body?.mid ?? sent?.body?.mid ?? sent?.id;
           return mid != null ? String(mid) : null;
         };
-        const editDraft = (text: string, final: boolean): Promise<void> => {
+        const editDraft = (
+          text: string,
+          final: boolean,
+          attachments?: MaxInlineKeyboardAttachment[],
+        ): Promise<void> => {
           draft.chain = draft.chain.then(async () => {
             const bot = getBot();
             if (!bot || !draft.mid) return;
             try {
-              await bot.api.editMessage(draft.mid, { text, format: "markdown" });
+              await bot.api.editMessage(draft.mid, {
+                text,
+                format: "markdown",
+                ...(attachments ? { attachments } : {}),
+              });
             } catch {
               // invalid markdown must not lose the reply
               try {
-                await bot.api.editMessage(draft.mid, { text });
+                await bot.api.editMessage(draft.mid, { text, ...(attachments ? { attachments } : {}) });
               } catch {
                 // best-effort preview
               }
@@ -372,7 +445,7 @@ async function runInbound(api: OpenClawPluginApi, facts: InboundFacts, token: st
             draft.lastEditAt = Date.now();
             if (!final) {
               // MAX clears the typing indicator on edit — renew it
-              bot.api.sendAction(Number(chatId), "typing_on").catch(() => {});
+              if (replyUserId == null) bot.api.sendAction(Number(chatId), "typing_on").catch(() => {});
             }
           });
           return draft.chain;
@@ -388,7 +461,7 @@ async function runInbound(api: OpenClawPluginApi, facts: InboundFacts, token: st
           if (!draft.mid) {
             try {
               draft.mid = extractMid(
-                await bot.api.sendMessageToChat(Number(chatId), preview, { format: "markdown" }),
+                await sendReplyMessage(bot, preview, { format: "markdown" }),
               );
             } catch {
               draft.mid = null;
@@ -413,7 +486,7 @@ async function runInbound(api: OpenClawPluginApi, facts: InboundFacts, token: st
             updateLastRoute: {
               sessionKey,
               channel: MAX_CHANNEL_ID,
-              to: `max:${chatId}`,
+              to: facts.replyTarget ?? `max:${chatId}`,
               accountId: route.accountId,
             },
             onRecordError: (err: unknown) =>
@@ -436,19 +509,37 @@ async function runInbound(api: OpenClawPluginApi, facts: InboundFacts, token: st
                   const bot = getBot();
                   const out = typeof payload?.text === "string" ? payload.text : "";
                   if (!bot) return undefined;
+                  // Inline keyboard travels on the payload as opaque
+                  // channelData (the core forwards it untouched); it is
+                  // attached only to the final authoritative message — never
+                  // to streaming draft edits.
+                  let keyboardButtons: ReturnType<typeof resolveReplyKeyboardButtons> = null;
+                  try {
+                    keyboardButtons = resolveReplyKeyboardButtons(payload?.channelData);
+                  } catch (err: any) {
+                    api.logger.warn(`[MAX] invalid maxInlineKeyboard, sending without keyboard: ${err?.message ?? err}`);
+                  }
+                  const keyboardAttachment = keyboardButtons
+                    ? toInlineKeyboardAttachment(keyboardButtons)
+                    : undefined;
                   if (draft.mid) {
                     // The draft exists: edit it into the authoritative final text
                     // (no cursor), then send any overflow chunks as new messages.
+                    // The keyboard rides on the final edit of the draft message.
                     const finalText = out.trim() ? out : draft.accumulated;
                     const chunks = chunkText(finalText, MAX_TEXT_LIMIT);
-                    await editDraft(chunks[0] ?? "", true);
+                    await editDraft(
+                      chunks[0] ?? "",
+                      true,
+                      keyboardAttachment ? [keyboardAttachment] : undefined,
+                    );
                     const messageIds = [draft.mid];
                     for (const chunk of chunks.slice(1)) {
                       let sent;
                       try {
-                        sent = await bot.api.sendMessageToChat(Number(chatId), chunk, { format: "markdown" });
+                        sent = await sendReplyMessage(bot, chunk, { format: "markdown" });
                       } catch {
-                        sent = await bot.api.sendMessageToChat(Number(chatId), chunk);
+                        sent = await sendReplyMessage(bot, chunk);
                       }
                       const mid = extractMid(sent);
                       if (mid) messageIds.push(mid);
@@ -456,14 +547,24 @@ async function runInbound(api: OpenClawPluginApi, facts: InboundFacts, token: st
                     return { messageIds };
                   }
                   if (!out.trim()) return undefined;
+                  const chunks = chunkText(out, MAX_TEXT_LIMIT);
                   const messageIds: string[] = [];
-                  for (const chunk of chunkText(out, MAX_TEXT_LIMIT)) {
+                  for (let i = 0; i < chunks.length; i++) {
+                    const chunk = chunks[i];
+                    // Keyboard goes on the last chunk — the final message.
+                    const attachments =
+                      i === chunks.length - 1 && keyboardAttachment ? [keyboardAttachment] : undefined;
                     let sent;
                     try {
-                      sent = await bot.api.sendMessageToChat(Number(chatId), chunk, { format: "markdown" });
+                      sent = await sendReplyMessage(bot, chunk, {
+                        format: "markdown",
+                        ...(attachments ? { attachments } : {}),
+                      });
                     } catch {
                       // invalid markdown must not lose the reply
-                      sent = await bot.api.sendMessageToChat(Number(chatId), chunk);
+                      sent = await sendReplyMessage(bot, chunk, {
+                        ...(attachments ? { attachments } : {}),
+                      });
                     }
                     const mid = extractMid(sent);
                     if (mid) messageIds.push(mid);
@@ -483,7 +584,7 @@ async function runInbound(api: OpenClawPluginApi, facts: InboundFacts, token: st
 }
 
 /** Shared update handler for webhook and polling transports. */
-async function handleUpdate(api: OpenClawPluginApi, update: any, token: string): Promise<void> {
+export async function handleUpdate(api: OpenClawPluginApi, update: any, token: string): Promise<void> {
   const facts = extractInboundFacts(update);
   if (!facts) return;
 
@@ -493,6 +594,20 @@ async function handleUpdate(api: OpenClawPluginApi, update: any, token: string):
   if (isDuplicate(facts.messageId)) {
     api.logger.info(`[MAX] duplicate message ${facts.messageId} ignored`);
     return;
+  }
+
+  // Inline keyboard callbacks: MAX shows a spinner on the button until the
+  // bot answers; acknowledge immediately (empty answer — no notification).
+  // The synthesized inbound still runs the full agent turn.
+  if (facts.callbackId) {
+    const bot = getBot();
+    if (bot) {
+      try {
+        await bot.api.answerOnCallback(facts.callbackId, { message: null });
+      } catch (err: any) {
+        api.logger.warn(`[MAX] answerOnCallback failed: ${err?.message ?? err}`);
+      }
+    }
   }
 
   await runInbound(api, facts, token);
