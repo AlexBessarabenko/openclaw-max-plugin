@@ -1,7 +1,8 @@
 import { timingSafeEqual } from "node:crypto";
 import { defineChannelPluginEntry } from "openclaw/plugin-sdk/channel-core";
 import { createTypingCallbacks } from "openclaw/plugin-sdk/channel-outbound";
-import { getBot, getMaxFetch, maxPlugin, normalizeMaxTarget, runOutsideInheritedRootWork, setMaxUpdateHandler, resolveGroupPolicyWarning, resolveMaxSendOptions, DEFAULT_ACCOUNT_ID, MAX_CHANNEL_ID } from "./channel.js";
+import { getBot, getMaxFetch, maxPlugin, normalizeMaxTarget, runOutsideInheritedRootWork, setMaxUpdateHandler, resolveGroupPolicyWarning, resolveMaxSendOptions, sendMaxMedia, resolveMaxUploadType, DEFAULT_ACCOUNT_ID, MAX_CHANNEL_ID } from "./channel.js";
+import { getAgentScopedMediaLocalRoots } from "openclaw/plugin-sdk/media-runtime";
 import {
   resolvePayloadKeyboardButtons,
   toInlineKeyboardAttachment,
@@ -560,6 +561,14 @@ async function runInbound(api: OpenClawPluginApi, facts: InboundFacts, token: st
 
         // --- Draft streaming: cumulative partial replies edit one draft message ---
         const streamingEnabled = (cfg.channels as any)?.[MAX_CHANNEL_ID]?.streaming !== false;
+        const ttsAuto = String(
+          (cfg as any)?.tts?.auto ?? (cfg as any)?.messages?.tts?.auto ?? "",
+        ).toLowerCase();
+        const ttsRepliesOn = ttsAuto !== "" && ttsAuto !== "off";
+        // When the reply will be spoken, a streaming draft is pure flicker —
+        // it gets deleted at delivery time, so skip it for voice turns.
+        const inboundHasVoice = (facts.attachments ?? []).some((a: any) => a?.type === "audio");
+        const voiceTurnExpected = ttsRepliesOn && (ttsAuto === "always" || inboundHasVoice);
         const STREAM_EDIT_INTERVAL_MS = 800;
         const draft = {
           mid: null as string | null,
@@ -567,6 +576,9 @@ async function runInbound(api: OpenClawPluginApi, facts: InboundFacts, token: st
           lastEditAt: 0,
           chain: Promise.resolve() as Promise<void>,
         };
+        // One voice message per turn: tool-TTS + auto-TTS would otherwise
+        // deliver two syntheses of the same reply.
+        let turnAudioSent = false;
         const extractMid = (sent: any): string | null => {
           const mid = sent?.message?.body?.mid ?? sent?.body?.mid ?? sent?.id;
           return mid != null ? String(mid) : null;
@@ -602,7 +614,7 @@ async function runInbound(api: OpenClawPluginApi, facts: InboundFacts, token: st
           return draft.chain;
         };
         const onPartialReply = async (payload: any): Promise<boolean> => {
-          if (!streamingEnabled) return false;
+          if (!streamingEnabled || voiceTurnExpected) return false;
           const text = typeof payload?.text === "string" ? payload.text : "";
           if (!text.trim()) return false;
           const bot = getBot();
@@ -678,6 +690,84 @@ async function runInbound(api: OpenClawPluginApi, facts: InboundFacts, token: st
                   // Per-message send options: channelData.maxNotify /
                   // maxDisableLinkPreview override the channel config defaults.
                   const sendOpts = resolveMaxSendOptions(cfg, payload?.channelData);
+                  // Reply-path media (TTS audio, tool attachments): payloads may
+                  // carry mediaUrl/mediaUrls (media-store paths or URLs). The
+                  // text is delivered separately, so media goes without a
+                  // caption; a media-only payload skips the text path entirely.
+                  const mediaUrls = [
+                    ...new Set(
+                      [payload?.mediaUrl, ...(Array.isArray(payload?.mediaUrls) ? payload.mediaUrls : [])]
+                        .filter((u): u is string => typeof u === "string" && Boolean(u.trim()))
+                        .map((u) => u.trim()),
+                    ),
+                  ];
+                  // Voice (TTS) payloads are delivered as audio only: MAX
+                  // renders an auto-transcript under voice messages, so a text
+                  // copy would duplicate the reply. At most one audio goes out
+                  // per turn: the tts tool result and the auto-TTS supplement
+                  // otherwise deliver the same spoken reply twice — and the
+                  // tool copy can arrive on a payload WITHOUT the voice
+                  // markers, so the dedup must not rely on them. When the
+                  // agent has TTS replies enabled (messages.tts.auto != off),
+                  // ANY audio on the reply path is treated as the spoken
+                  // reply: no separate text bubble, no leftover streaming
+                  // draft. Without audio (TTS failed) text is the fallback.
+                  const isAudioMedia = (u: string): boolean =>
+                    resolveMaxUploadType(u.split("?")[0].split("#")[0].split("/").pop()) === "audio";
+                  const isVoicePayload =
+                    payload?.audioAsVoice === true || typeof payload?.spokenText === "string";
+                  let sendText = true;
+                  let deliverMediaUrls = mediaUrls;
+                  {
+                    const audio = mediaUrls.filter(isAudioMedia);
+                    const rest = mediaUrls.filter((u) => !isAudioMedia(u));
+                    if (audio.length > 0) {
+                      const voiceTurn = isVoicePayload || ttsRepliesOn;
+                      if (turnAudioSent) {
+                        api.logger.info("[MAX] duplicate reply audio skipped (audio already sent this turn)");
+                        deliverMediaUrls = rest;
+                        if (voiceTurn) sendText = false;
+                      } else if (voiceTurn) {
+                        if (audio.length > 1) {
+                          api.logger.info("[MAX] extra TTS audio attachments skipped in one delivery");
+                        }
+                        deliverMediaUrls = [audio[0], ...rest];
+                        sendText = false;
+                      }
+                    }
+                  }
+                  const includesAudio = deliverMediaUrls.some(isAudioMedia);
+                  const sendReplyMedia = async (): Promise<string[]> => {
+                    const ids: string[] = [];
+                    const to = replyUserId != null ? `user:${replyUserId}` : String(chatId);
+                    for (const mediaUrl of deliverMediaUrls) {
+                      try {
+                        const mid = await sendMaxMedia(bot, {
+                          to,
+                          text: "",
+                          mediaUrl,
+                          mediaLocalRoots: getAgentScopedMediaLocalRoots(cfg),
+                          extra: sendOpts,
+                        });
+                        if (mid) ids.push(mid);
+                      } catch (err: any) {
+                        api.logger.warn(`[MAX] reply media send failed: ${err?.message ?? err}`);
+                      }
+                    }
+                    if (ids.length > 0 && includesAudio) turnAudioSent = true;
+                    return ids;
+                  };
+                  if (draft.mid && !sendText) {
+                    // Voice-only reply: drop the streaming draft, the audio
+                    // says it all.
+                    try {
+                      await bot.api.deleteMessage(draft.mid);
+                    } catch {
+                      // best-effort cleanup
+                    }
+                    const messageIds = await sendReplyMedia();
+                    return messageIds.length > 0 ? { messageIds } : undefined;
+                  }
                   if (draft.mid) {
                     // The draft exists: edit it into the authoritative final text
                     // (no cursor), then send any overflow chunks as new messages.
@@ -700,33 +790,37 @@ async function runInbound(api: OpenClawPluginApi, facts: InboundFacts, token: st
                       const mid = extractMid(sent);
                       if (mid) messageIds.push(mid);
                     }
+                    messageIds.push(...(await sendReplyMedia()));
                     return { messageIds };
                   }
-                  if (!out.trim()) return undefined;
-                  const chunks = chunkText(out, MAX_TEXT_LIMIT);
+                  if ((!sendText || !out.trim()) && deliverMediaUrls.length === 0) return undefined;
                   const messageIds: string[] = [];
-                  for (let i = 0; i < chunks.length; i++) {
-                    const chunk = chunks[i];
-                    // Keyboard goes on the last chunk — the final message.
-                    const attachments =
-                      i === chunks.length - 1 && keyboardAttachment ? [keyboardAttachment] : undefined;
-                    let sent;
-                    try {
-                      sent = await sendReplyMessage(bot, chunk, {
-                        format: "markdown",
-                        ...sendOpts,
-                        ...(attachments ? { attachments } : {}),
-                      });
-                    } catch {
-                      // invalid markdown must not lose the reply
-                      sent = await sendReplyMessage(bot, chunk, {
-                        ...sendOpts,
-                        ...(attachments ? { attachments } : {}),
-                      });
+                  if (sendText && out.trim()) {
+                    const chunks = chunkText(out, MAX_TEXT_LIMIT);
+                    for (let i = 0; i < chunks.length; i++) {
+                      const chunk = chunks[i];
+                      // Keyboard goes on the last chunk — the final message.
+                      const attachments =
+                        i === chunks.length - 1 && keyboardAttachment ? [keyboardAttachment] : undefined;
+                      let sent;
+                      try {
+                        sent = await sendReplyMessage(bot, chunk, {
+                          format: "markdown",
+                          ...sendOpts,
+                          ...(attachments ? { attachments } : {}),
+                        });
+                      } catch {
+                        // invalid markdown must not lose the reply
+                        sent = await sendReplyMessage(bot, chunk, {
+                          ...sendOpts,
+                          ...(attachments ? { attachments } : {}),
+                        });
+                      }
+                      const mid = extractMid(sent);
+                      if (mid) messageIds.push(mid);
                     }
-                    const mid = extractMid(sent);
-                    if (mid) messageIds.push(mid);
                   }
+                  messageIds.push(...(await sendReplyMedia()));
                   return messageIds.length > 0 ? { messageIds } : undefined;
                 },
                 onError: (err: any) => {
@@ -925,13 +1019,16 @@ export async function handleUpdate(api: OpenClawPluginApi, update: any, token: s
   }
 
   // Inline keyboard callbacks: MAX shows a spinner on the button until the
-  // bot answers; acknowledge immediately (empty answer — no notification).
+  // bot answers; acknowledge immediately. The API rejects a truly empty
+  // answer ("message or notification required"), so send a zero-width-space
+  // notification — it renders as a blank toast. The SDK type lags behind
+  // the server and only declares `message`, hence the cast.
   // The synthesized inbound still runs the full agent turn.
   if (facts.callbackId) {
     const bot = getBot();
     if (bot) {
       try {
-        await bot.api.answerOnCallback(facts.callbackId, { message: null });
+        await bot.api.answerOnCallback(facts.callbackId, { notification: "\u200b" } as any);
       } catch (err: any) {
         api.logger.warn(`[MAX] answerOnCallback failed: ${err?.message ?? err}`);
       }

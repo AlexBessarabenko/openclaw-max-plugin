@@ -131,6 +131,41 @@ environment itself and sent audio to Groq with a hardcoded Russian locale. If yo
 relied on that, add the `tools.media.audio` block above — a 1:1 replacement that is
 additionally consent-gated and locale-configurable.
 
+**Inbound voice-note coverage is client-dependent.** Verified live: voice notes
+recorded in the **iOS** app arrive over long polling; the same notes recorded in the
+**Android** app may not be delivered to bots over polling at all. For full coverage
+run the bot in **webhook** mode (`webhookUrl`) behind a public HTTPS endpoint —
+e.g. Caddy or nginx with Let's Encrypt, or a tunnel like CloudPub.
+
+### Voice replies (TTS)
+
+Replies can be voiced through the gateway's TTS pipeline — the plugin only delivers
+the resulting audio file. Verified working with the **free Microsoft Edge TTS**
+provider (no API key required) — enable the bundled `microsoft` plugin and set it as
+the TTS provider in `~/.openclaw/openclaw.json`:
+
+```json
+{
+  "plugins": { "entries": { "microsoft": { "enabled": true } } },
+  "tts": {
+    "auto": "inbound",
+    "provider": "microsoft",
+    "providers": {
+      "microsoft": { "voice": "ru-RU-DmitryNeural", "lang": "ru-RU" }
+    }
+  }
+}
+```
+
+Russian voices to choose from: **`ru-RU-DmitryNeural`** (male) or
+**`ru-RU-SvetlanaNeural`** (female). `auto: "inbound"` voices replies only to voice
+messages; `"always"` voices every reply. OpenRouter (`hexgrad/kokoro-82m`) also
+works, but Kokoro has no Russian language support — use it for English only.
+
+> Note: the `microsoft` plugin must be allowed by your `plugins.allow` list when one
+> is configured, and a gateway **restart** is required after enabling it (speech
+> providers register at startup; a hot reload is not enough).
+
 ### TLS certificates (platform-api2.max.ru)
 
 MAX officially requires bots to migrate to `platform-api2.max.ru` and to trust the
@@ -378,9 +413,10 @@ authentication can be embedded in the URL (`http://user:pass@host:port`).
 |------|----------|----------|-------|
 | Text | ✅ | ✅ | Markdown, chunked at 4000 chars |
 | Images | ✅ | ✅ | Saved to media store, analyzed via imageModel; remote image URLs attach by link (no re-upload) |
-| Audio/Voice | ✅ | ⚠️ | Transcribed via gateway STT (`tools.media.audio`) |
+| Audio/Voice | ✅* | ⚠️ | Transcribed via gateway STT (`tools.media.audio`). *Inbound voice notes verified from iOS via polling; Android may require webhook mode |
 | Video | ✅ | ⚠️ | Saved to media store; token-only videos resolve a playback URL via `GET /videos/{token}` |
 | Files | ✅ | ⚠️ | PDFs analyzed via pdfModel; agent-served files via the `max_send_file` tool |
+| Polls | ❌ | — | MAX does not deliver poll events to bots at all (neither polling nor webhook) |
 | Stickers | ✅ | ✅ | Incoming arrive as `[Sticker (code …)]` (cached 30 min per chat); outgoing = echo by code (`action="sticker"`) |
 | Contacts | ✅ | ✅ | Incoming `[Contact: Name]`; outgoing via `sendAttachment type="contact"` |
 | Locations | ✅ | ✅ | Incoming as a Yandex Maps link; outgoing via `sendAttachment type="location"` |

@@ -124,6 +124,16 @@ export const maxMessageActions: ChannelMessageActionAdapter = {
 
   supportsAction: ({ action }) => (SUPPORTED_ACTIONS as readonly string[]).includes(action),
 
+  // Without this hook the core DROPS channelData/interactive on the message
+  // tool send path: executeSendAction (message-action-runner) only keeps the
+  // built payload when the plugin prepared it, or when it carries a
+  // `presentation` the channel can render. A channelData-only send
+  // (maxInlineKeyboard!) fell through to a plain text-only core send and the
+  // keyboard silently vanished. Passing the payload through marks it
+  // "prepared", so the core delivers it as-is — and payloads with channelData
+  // route to our outbound.sendPayload, which attaches the keyboard.
+  prepareSendPayload: ({ payload }) => payload,
+
   // edit/delete are addressed by messageId, not a chat target; declare the
   // alias so the runner accepts them without a `target` param.
   messageActionTargetAliases: {

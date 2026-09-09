@@ -106,7 +106,7 @@ describe("message_callback → inbound", () => {
 
     // Callback acknowledged immediately (spinner on the button stops).
     expect(fakeBot.api.answerOnCallback).toHaveBeenCalledTimes(1);
-    expect(fakeBot.api.answerOnCallback).toHaveBeenCalledWith("cb-777", { message: null });
+    expect(fakeBot.api.answerOnCallback).toHaveBeenCalledWith("cb-777", { notification: "\u200b" });
 
     // Inbound facts: text = payload + quote of the source message, routing
     // from user + message recipient.

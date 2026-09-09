@@ -57,6 +57,19 @@ describe("describeMessageTool", () => {
   });
 });
 
+describe("prepareSendPayload", () => {
+  it("passes the payload through so the core keeps channelData on the tool send path", async () => {
+    const payload = {
+      text: "Выбери день:",
+      channelData: { maxInlineKeyboard: [[{ text: "Пн", payload: "mon" }]] },
+    };
+    const result = await maxMessageActions.prepareSendPayload?.({
+      payload,
+    } as any);
+    expect(result).toBe(payload);
+  });
+});
+
 describe("supportsAction", () => {
   it("owns edit/delete/pin/unpin/sticker/sendAttachment and nothing else", () => {
     const supports = (action: string) =>

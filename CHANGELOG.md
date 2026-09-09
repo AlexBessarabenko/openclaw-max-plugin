@@ -69,6 +69,28 @@ Tested with OpenClaw **2026.9.3**.
 - Attachment limits: at most 10 per message, 25 MB each; oversized downloads abort
   before buffering.
 
+### Fixed
+
+- **Reply-path media delivery** — payloads carrying `mediaUrl`/`mediaUrls` (TTS audio
+  from the media store, tool attachments) are uploaded and sent; the text-only path
+  previously swallowed them.
+- **Voice (TTS) delivery** — at most one audio per turn: the `tts` tool result and the
+  auto-TTS supplement no longer deliver the same spoken reply twice (the tool copy can
+  arrive without the voice markers, so the dedup is marker-independent). Voice payloads
+  go out as audio only — MAX renders an auto-transcript, so a text copy is suppressed;
+  when TTS replies are enabled (`tts.auto` ≠ `off`) any reply-path audio is treated as
+  the spoken reply and the streaming draft is skipped/deleted instead of flickering.
+  Plain text fallback when synthesis failed. Honors the agent's own `tts.auto` mode.
+- **Inline keyboards via the `message` tool** — the channel now implements the
+  `prepareSendPayload` action hook: core's `executeSendAction` drops payloads that carry
+  only `channelData` unless the plugin prepares them, which silently stripped
+  `maxInlineKeyboard` on tool sends. Both syntaxes now work on every path:
+  `presentation.blocks[].buttons` (preferred; the channel declares the `presentation`
+  capability) and `channelData.maxInlineKeyboard`.
+- **Callback acknowledgement** — `answerOnCallback` sends a zero-width-space
+  notification; the MAX API rejects a truly empty answer (400), leaving the button
+  spinner running.
+
 ## [0.4.0] - 2026-09-05
 
 ### Added
