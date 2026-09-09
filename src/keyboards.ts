@@ -1,4 +1,12 @@
 import { z } from "zod";
+import {
+  legacyInteractiveReplyToPresentation,
+  normalizeLegacyInteractiveReply,
+  normalizeMessagePresentation,
+  resolveMessagePresentationButtonAction,
+  resolveMessagePresentationControlValue,
+} from "openclaw/plugin-sdk/interactive-runtime";
+import type { MessagePresentationButton } from "openclaw/plugin-sdk/interactive-runtime";
 
 /**
  * MAX inline keyboards: validation, limits and wire serialization.
@@ -180,4 +188,85 @@ export function resolveReplyKeyboardButtons(channelData: unknown): MaxButton[][]
   if (raw === undefined || raw === null) return null;
   const buttons = parseInlineKeyboardInput(raw);
   return buttons.length > 0 ? buttons : null;
+}
+
+/**
+ * Portable `presentation`/`interactive` reply payloads (core 2026.9.x) → MAX
+ * inline keyboard rows. Buttons pack 3 per row (matches the restricted-type
+ * row cap, so link and callback buttons can mix freely).
+ *
+ * Mapping (mirrors the core Telegram adapter):
+ *   - action url / web-app with a URL → link button (MAX has no web-app type)
+ *   - action callback / command, or a plain `value` → callback button
+ *   - disabled buttons and buttons with no resolvable action are dropped
+ *
+ * @throws MaxKeyboardError when the result exceeds the MAX keyboard limits
+ */
+export const MAX_PRESENTATION_ROW_SIZE = 3;
+
+function presentationButtonToMaxButton(button: MessagePresentationButton): MaxButton | null {
+  if (button.disabled === true) return null;
+  const label = typeof button.label === "string" ? button.label.trim() : "";
+  if (!label) return null;
+  const action = resolveMessagePresentationButtonAction(button);
+  if (!action) return null;
+  if ((action.type === "url" || action.type === "web-app") && action.url) {
+    return { type: "link", text: label, url: action.url };
+  }
+  const value = resolveMessagePresentationControlValue(button);
+  if (typeof value === "string" && value.trim()) {
+    return { type: "callback", text: label, payload: value };
+  }
+  return null;
+}
+
+export function presentationToMaxButtons(rawPresentation: unknown): MaxButton[][] | null {
+  const presentation = normalizeMessagePresentation(rawPresentation);
+  if (!presentation) return null;
+  const rows: MaxButton[][] = [];
+  let row: MaxButton[] = [];
+  const flush = () => {
+    if (row.length > 0) {
+      rows.push(row);
+      row = [];
+    }
+  };
+  for (const block of presentation.blocks) {
+    if (block.type !== "buttons") continue;
+    for (const button of block.buttons) {
+      const rendered = presentationButtonToMaxButton(button);
+      if (!rendered) continue;
+      row.push(rendered);
+      if (row.length === MAX_PRESENTATION_ROW_SIZE) flush();
+    }
+  }
+  flush();
+  if (rows.length === 0) return null;
+  assertKeyboardLimits(rows);
+  return rows;
+}
+
+/** Legacy `interactive` reply payloads → MAX rows (via the presentation shape). */
+export function interactiveToMaxButtons(rawInteractive: unknown): MaxButton[][] | null {
+  const interactive = normalizeLegacyInteractiveReply(rawInteractive);
+  if (!interactive) return null;
+  const presentation = legacyInteractiveReplyToPresentation(interactive);
+  if (!presentation) return null;
+  return presentationToMaxButtons(presentation);
+}
+
+/**
+ * Resolve the keyboard for any reply/outbound payload. Precedence mirrors the
+ * core Telegram adapter: explicit `channelData.maxInlineKeyboard` wins, then
+ * legacy `interactive`, then portable `presentation` buttons blocks.
+ *
+ * @throws MaxKeyboardError (callers warn and deliver without a keyboard)
+ */
+export function resolvePayloadKeyboardButtons(
+  payload: { channelData?: unknown; interactive?: unknown; presentation?: unknown } | null | undefined,
+): MaxButton[][] | null {
+  if (!payload || typeof payload !== "object") return null;
+  const fromChannelData = resolveReplyKeyboardButtons(payload.channelData);
+  if (fromChannelData) return fromChannelData;
+  return interactiveToMaxButtons(payload.interactive) ?? presentationToMaxButtons(payload.presentation);
 }

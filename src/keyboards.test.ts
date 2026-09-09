@@ -2,7 +2,10 @@ import { describe, expect, it } from "vitest";
 import {
   MAX_KEYBOARD_LIMITS,
   MaxKeyboardError,
+  interactiveToMaxButtons,
   parseInlineKeyboardInput,
+  presentationToMaxButtons,
+  resolvePayloadKeyboardButtons,
   resolveReplyKeyboardButtons,
   toInlineKeyboardAttachment,
 } from "./keyboards.js";
@@ -136,5 +139,123 @@ describe("resolveReplyKeyboardButtons", () => {
     expect(() => resolveReplyKeyboardButtons({ maxInlineKeyboard: rows })).toThrow(
       MaxKeyboardError,
     );
+  });
+});
+
+describe("presentationToMaxButtons", () => {
+  it("maps url and callback buttons onto MAX wire rows, 3 per row", () => {
+    const rows = presentationToMaxButtons({
+      blocks: [
+        {
+          type: "buttons",
+          buttons: [
+            { label: "Да", value: "vote:yes" },
+            { label: "Нет", action: { type: "callback", value: "vote:no" } },
+            { label: "Docs", url: "https://dev.max.ru" },
+            { label: "Ещё", action: { type: "command", command: "/more" } },
+          ],
+        },
+      ],
+    });
+    expect(rows).toEqual([
+      [
+        { type: "callback", text: "Да", payload: "vote:yes" },
+        { type: "callback", text: "Нет", payload: "vote:no" },
+        { type: "link", text: "Docs", url: "https://dev.max.ru" },
+      ],
+      [{ type: "callback", text: "Ещё", payload: "/more" }],
+    ]);
+  });
+
+  it("degrades web-app buttons to plain link buttons", () => {
+    expect(
+      presentationToMaxButtons({
+        blocks: [{ type: "buttons", buttons: [{ label: "App", webApp: { url: "https://app.max.ru" } }] }],
+      }),
+    ).toEqual([[{ type: "link", text: "App", url: "https://app.max.ru" }]]);
+  });
+
+  it("ignores text blocks and drops disabled/actionless buttons", () => {
+    const rows = presentationToMaxButtons({
+      title: "Выбор",
+      blocks: [
+        { type: "text", text: "Взять заказ?" },
+        {
+          type: "buttons",
+          buttons: [
+            { label: "Взять", value: "take" },
+            { label: "Позже", value: "later", disabled: true },
+            { label: "Пустая" },
+          ],
+        },
+      ],
+    });
+    expect(rows).toEqual([[{ type: "callback", text: "Взять", payload: "take" }]]);
+  });
+
+  it("returns null when nothing is renderable", () => {
+    expect(presentationToMaxButtons(undefined)).toBeNull();
+    expect(presentationToMaxButtons({ blocks: [{ type: "text", text: "hi" }] })).toBeNull();
+    expect(
+      presentationToMaxButtons({ blocks: [{ type: "buttons", buttons: [{ label: "x" }] }] }),
+    ).toBeNull();
+  });
+
+  it("throws MaxKeyboardError when the result exceeds MAX limits", () => {
+    // 100 buttons pack 3 per row → 34 rows > 30-row cap.
+    const buttons = Array.from({ length: 100 }, (_, i) => ({ label: `b${i}`, value: `v${i}` }));
+    expect(() =>
+      presentationToMaxButtons({ blocks: [{ type: "buttons", buttons }] }),
+    ).toThrow(MaxKeyboardError);
+  });
+});
+
+describe("interactiveToMaxButtons", () => {
+  it("maps legacy interactive buttons blocks", () => {
+    expect(
+      interactiveToMaxButtons({
+        blocks: [
+          { type: "text", text: "pick one" },
+          { type: "buttons", buttons: [{ label: "OK", value: "ok" }] },
+        ],
+      }),
+    ).toEqual([[{ type: "callback", text: "OK", payload: "ok" }]]);
+  });
+
+  it("returns null for non-interactive input", () => {
+    expect(interactiveToMaxButtons(undefined)).toBeNull();
+    expect(interactiveToMaxButtons({ blocks: [] })).toBeNull();
+  });
+});
+
+describe("resolvePayloadKeyboardButtons", () => {
+  it("prefers channelData.maxInlineKeyboard over interactive and presentation", () => {
+    const payload = {
+      channelData: { maxInlineKeyboard: [["Explicit"]] },
+      interactive: { blocks: [{ type: "buttons", buttons: [{ label: "I", value: "i" }] }] },
+      presentation: { blocks: [{ type: "buttons", buttons: [{ label: "P", value: "p" }] }] },
+    };
+    expect(resolvePayloadKeyboardButtons(payload)).toEqual([
+      [{ type: "callback", text: "Explicit", payload: "Explicit" }],
+    ]);
+  });
+
+  it("falls back to interactive, then presentation", () => {
+    expect(
+      resolvePayloadKeyboardButtons({
+        interactive: { blocks: [{ type: "buttons", buttons: [{ label: "I", value: "i" }] }] },
+        presentation: { blocks: [{ type: "buttons", buttons: [{ label: "P", value: "p" }] }] },
+      }),
+    ).toEqual([[{ type: "callback", text: "I", payload: "i" }]]);
+    expect(
+      resolvePayloadKeyboardButtons({
+        presentation: { blocks: [{ type: "buttons", buttons: [{ label: "P", value: "p" }] }] },
+      }),
+    ).toEqual([[{ type: "callback", text: "P", payload: "p" }]]);
+  });
+
+  it("returns null for payloads without any keyboard", () => {
+    expect(resolvePayloadKeyboardButtons(null)).toBeNull();
+    expect(resolvePayloadKeyboardButtons({ text: "hi" })).toBeNull();
   });
 });

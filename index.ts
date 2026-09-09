@@ -3,7 +3,7 @@ import { defineChannelPluginEntry } from "openclaw/plugin-sdk/channel-core";
 import { createTypingCallbacks } from "openclaw/plugin-sdk/channel-outbound";
 import { getBot, getMaxFetch, maxPlugin, normalizeMaxTarget, runOutsideInheritedRootWork, setMaxUpdateHandler, resolveGroupPolicyWarning, resolveMaxSendOptions, DEFAULT_ACCOUNT_ID, MAX_CHANNEL_ID } from "./channel.js";
 import {
-  resolveReplyKeyboardButtons,
+  resolvePayloadKeyboardButtons,
   toInlineKeyboardAttachment,
   type MaxInlineKeyboardAttachment,
 } from "./src/keyboards.js";
@@ -661,15 +661,16 @@ async function runInbound(api: OpenClawPluginApi, facts: InboundFacts, token: st
                   const bot = getBot();
                   const out = typeof payload?.text === "string" ? payload.text : "";
                   if (!bot) return undefined;
-                  // Inline keyboard travels on the payload as opaque
-                  // channelData (the core forwards it untouched); it is
-                  // attached only to the final authoritative message — never
-                  // to streaming draft edits.
-                  let keyboardButtons: ReturnType<typeof resolveReplyKeyboardButtons> = null;
+                  // Inline keyboard: explicit channelData.maxInlineKeyboard
+                  // wins; otherwise portable `interactive` / `presentation`
+                  // buttons blocks are mapped onto MAX rows. It is attached
+                  // only to the final authoritative message — never to
+                  // streaming draft edits.
+                  let keyboardButtons: ReturnType<typeof resolvePayloadKeyboardButtons> = null;
                   try {
-                    keyboardButtons = resolveReplyKeyboardButtons(payload?.channelData);
+                    keyboardButtons = resolvePayloadKeyboardButtons(payload);
                   } catch (err: any) {
-                    api.logger.warn(`[MAX] invalid maxInlineKeyboard, sending without keyboard: ${err?.message ?? err}`);
+                    api.logger.warn(`[MAX] invalid inline keyboard, sending without keyboard: ${err?.message ?? err}`);
                   }
                   const keyboardAttachment = keyboardButtons
                     ? toInlineKeyboardAttachment(keyboardButtons)

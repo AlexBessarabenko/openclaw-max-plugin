@@ -100,6 +100,10 @@ export const maxMessageActions = {
             return null;
         return {
             actions: [...SUPPORTED_ACTIONS],
+            // "presentation" adds the portable `presentation` param (buttons blocks)
+            // to the message tool send schema; outbound.renderPresentation maps it
+            // onto a MAX inline keyboard.
+            capabilities: ["presentation"],
         };
     },
     supportsAction: ({ action }) => SUPPORTED_ACTIONS.includes(action),

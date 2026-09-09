@@ -197,7 +197,96 @@ describe("deliver with inline keyboard", () => {
     const sendArgs = fakeBot.api.sendMessageToChat.mock.calls[0];
     expect(sendArgs[2]).toEqual({ format: "markdown" });
     expect(api.logger.warn).toHaveBeenCalledWith(
-      expect.stringMatching(/invalid maxInlineKeyboard/),
+      expect.stringMatching(/invalid inline keyboard/),
     );
+  });
+
+  it("maps portable presentation buttons onto the inline keyboard", async () => {
+    const { captured } = await setupDispatchedTurn("m-k5");
+    fakeBot.api.sendMessageToChat.mockResolvedValue({ message: { body: { mid: "pres-1" } } });
+
+    await captured.dispatch.dispatcherOptions.deliver({
+      text: "Выбирай",
+      presentation: {
+        blocks: [
+          { type: "text", text: "Выбирай" },
+          {
+            type: "buttons",
+            buttons: [
+              { label: "Да", value: "yes" },
+              { label: "Сайт", url: "https://max.ru" },
+            ],
+          },
+        ],
+      },
+    });
+
+    expect(fakeBot.api.sendMessageToChat).toHaveBeenCalledWith(
+      5050,
+      "Выбирай",
+      expect.objectContaining({
+        attachments: [
+          {
+            type: "inline_keyboard",
+            payload: {
+              buttons: [
+                [
+                  { type: "callback", text: "Да", payload: "yes" },
+                  { type: "link", text: "Сайт", url: "https://max.ru" },
+                ],
+              ],
+            },
+          },
+        ],
+      }),
+    );
+  });
+
+  it("maps legacy interactive buttons and lands them on the final draft edit", async () => {
+    const { captured } = await setupDispatchedTurn("m-k6");
+    fakeBot.api.sendMessageToChat.mockResolvedValue({ message: { body: { mid: "draft-6" } } });
+
+    await captured.dispatch.replyOptions.onPartialReply({ text: "Черновик" });
+
+    await captured.dispatch.dispatcherOptions.deliver({
+      text: "Финал",
+      interactive: {
+        blocks: [{ type: "buttons", buttons: [{ label: "OK", value: "ok" }] }],
+      },
+    });
+
+    expect(fakeBot.api.editMessage).toHaveBeenCalledWith(
+      "draft-6",
+      expect.objectContaining({
+        text: "Финал",
+        attachments: [
+          {
+            type: "inline_keyboard",
+            payload: { buttons: [[{ type: "callback", text: "OK", payload: "ok" }]] },
+          },
+        ],
+      }),
+    );
+  });
+
+  it("prefers channelData.maxInlineKeyboard over presentation buttons", async () => {
+    const { captured } = await setupDispatchedTurn("m-k7");
+    fakeBot.api.sendMessageToChat.mockResolvedValue({ message: { body: { mid: "both-1" } } });
+
+    await captured.dispatch.dispatcherOptions.deliver({
+      text: "Оба",
+      channelData: { maxInlineKeyboard: [["Explicit"]] },
+      presentation: {
+        blocks: [{ type: "buttons", buttons: [{ label: "P", value: "p" }] }],
+      },
+    });
+
+    const sendArgs = fakeBot.api.sendMessageToChat.mock.calls[0];
+    expect(sendArgs[2].attachments).toEqual([
+      {
+        type: "inline_keyboard",
+        payload: { buttons: [[{ type: "callback", text: "Explicit", payload: "Explicit" }]] },
+      },
+    ]);
   });
 });

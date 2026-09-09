@@ -26,7 +26,7 @@ Tested with OpenClaw **2026.9.3**, MAX Bot API v2 (`platform-api2.max.ru`).
 - ✅ **Streaming replies** — partial model output edits a single draft message in place (`editMessage`), final text replaces it; can be disabled
 - ✅ **Scoped HTTP proxy** — optional per-account proxy for MAX API traffic only, without touching the rest of the gateway
 - ✅ **Agent prompt hints** — the plugin teaches the agent MAX Markdown rules, the 4000-char limit and delivery-target syntax via `agentPrompt`
-- ✅ **Inline keyboards** — the agent attaches buttons via `channelData.maxInlineKeyboard`; button presses arrive as inbound messages and are auto-acknowledged
+- ✅ **Inline keyboards** — the agent attaches buttons via the `message` tool `presentation` param or `channelData.maxInlineKeyboard`; button presses arrive as inbound messages and are auto-acknowledged
 - ✅ **Message actions** — the agent edits/deletes its own messages, pins/unpins in chats, echoes stickers and sends native location pins / contact cards via the `message` tool
 - ✅ **`max_send_file` agent tool** — delivers a local file or an http(s) URL into the current MAX chat (media-roots confinement, SSRF-guarded download)
 - ✅ **Group policies** — `groupPolicy` (open/allowlist/disabled), per-group config with a `*` wildcard, `requireMention` (a reply to the bot counts as a mention)
@@ -235,9 +235,34 @@ chunk edits the draft, the rest arrive as follow-up messages. Set
 
 ### Inline keyboards (buttons)
 
-Since **0.5.0** the agent can attach inline keyboards to the final reply and react to
-button presses. Pass buttons via the `message` tool's `channelData.maxInlineKeyboard`
-(one inner array = one row):
+The agent can attach inline keyboards to the final reply and react to button
+presses. Two ways to describe buttons:
+
+**Portable `presentation` param of the `message` tool** (works on the tool send
+path, including `openclaw message send`-style deliveries):
+
+```json
+{
+  "presentation": {
+    "blocks": [
+      {
+        "type": "buttons",
+        "buttons": [
+          { "label": "Да", "value": "vote:yes" },
+          { "label": "Нет", "action": { "type": "callback", "value": "vote:no" } },
+          { "label": "Открыть", "url": "https://dev.max.ru" }
+        ]
+      }
+    ]
+  }
+}
+```
+
+`value` (or `action` `callback`/`command`) makes a callback button; `url` (or
+action type `url`/`web-app`) makes a link button. Buttons pack three per row.
+
+**`channelData.maxInlineKeyboard`** — on the agent's reply path (one inner
+array = one row), giving explicit control over row layout:
 
 ```json
 {
@@ -252,6 +277,8 @@ button presses. Pass buttons via the `message` tool's `channelData.maxInlineKeyb
 
 - Simplified `{text, url?, payload?}` (and plain strings — payload = label) or full wire
   buttons `{type: "callback"|"link"|"clipboard", …}`; URL buttons win over payload.
+- On any single payload `channelData.maxInlineKeyboard` wins over `presentation`
+  and legacy `interactive` buttons.
 - MAX limits enforced by validation: ≤ **210** buttons, ≤ **30** rows, ≤ **7** buttons
   per row (≤ **3** when the row contains a `link`-type button), link URL ≤ **2048** chars.
 - The keyboard rides only the **final** message (a streaming draft is edited into the
@@ -261,9 +288,6 @@ button presses. Pass buttons via the `message` tool's `channelData.maxInlineKeyb
   payload as text; the callback is auto-acknowledged (`POST /answers`), so no spinner
   is left hanging on the button. Make payloads self-describing — MAX does not echo the
   button label.
-- **Reply-path only:** keyboards are delivered only on the agent's reply path. The
-  durable path (`openclaw message send --channel max …`) does not carry `channelData`,
-  so no keyboard can be attached there.
 
 ### Message actions (message tool)
 
@@ -365,7 +389,7 @@ authentication can be embedded in the URL (`http://user:pass@host:port`).
 | Forwarded | ✅ | — | Content unwrapped from `link.message`, marked `[Forwarded from …]`; media processed as usual |
 | Replies | ✅ | — | Quoted original shown as `[Reply to …: "…"]` (≤200 chars) |
 | Edited messages | ✅ | ✅ | `message_edited` arrives marked `[Edited]`; the bot edits its own messages via `action="edit"` |
-| Keyboard buttons | ✅ | ✅ | Attach via `channelData.maxInlineKeyboard`; presses arrive as inbound messages |
+| Keyboard buttons | ✅ | ✅ | Attach via the `message` tool `presentation` param or `channelData.maxInlineKeyboard`; presses arrive as inbound messages |
 | Unknown types | ✅ | — | Marked `[Unsupported attachment: <type>]` so the agent knows something arrived |
 | Group chats | ✅ | ✅ | Per-chat sessions; `groupPolicy` / `requireMention` gates |
 

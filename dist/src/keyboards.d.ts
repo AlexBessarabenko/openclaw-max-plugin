@@ -67,4 +67,32 @@ export declare function toInlineKeyboardAttachment(buttons: MaxButton[][]): MaxI
  *   (callers warn and still deliver the text reply)
  */
 export declare function resolveReplyKeyboardButtons(channelData: unknown): MaxButton[][] | null;
+/**
+ * Portable `presentation`/`interactive` reply payloads (core 2026.9.x) → MAX
+ * inline keyboard rows. Buttons pack 3 per row (matches the restricted-type
+ * row cap, so link and callback buttons can mix freely).
+ *
+ * Mapping (mirrors the core Telegram adapter):
+ *   - action url / web-app with a URL → link button (MAX has no web-app type)
+ *   - action callback / command, or a plain `value` → callback button
+ *   - disabled buttons and buttons with no resolvable action are dropped
+ *
+ * @throws MaxKeyboardError when the result exceeds the MAX keyboard limits
+ */
+export declare const MAX_PRESENTATION_ROW_SIZE = 3;
+export declare function presentationToMaxButtons(rawPresentation: unknown): MaxButton[][] | null;
+/** Legacy `interactive` reply payloads → MAX rows (via the presentation shape). */
+export declare function interactiveToMaxButtons(rawInteractive: unknown): MaxButton[][] | null;
+/**
+ * Resolve the keyboard for any reply/outbound payload. Precedence mirrors the
+ * core Telegram adapter: explicit `channelData.maxInlineKeyboard` wins, then
+ * legacy `interactive`, then portable `presentation` buttons blocks.
+ *
+ * @throws MaxKeyboardError (callers warn and deliver without a keyboard)
+ */
+export declare function resolvePayloadKeyboardButtons(payload: {
+    channelData?: unknown;
+    interactive?: unknown;
+    presentation?: unknown;
+} | null | undefined): MaxButton[][] | null;
 //# sourceMappingURL=keyboards.d.ts.map

@@ -10,6 +10,8 @@ import { isPrivateOrLoopbackHost } from "openclaw/plugin-sdk/ssrf-runtime";
 import { primeSeenMessageIds, recentSeenMessageIds } from "./src/dedup.js";
 import { loadMaxPollingState, saveMaxPollingState } from "./src/polling-state.js";
 import { maxMessageActions } from "./src/actions.js";
+import { MAX_KEYBOARD_LIMITS, MAX_PRESENTATION_ROW_SIZE, presentationToMaxButtons, resolvePayloadKeyboardButtons, toInlineKeyboardAttachment, } from "./src/keyboards.js";
+import { normalizeMessagePresentation, renderMessagePresentationFallbackText, } from "openclaw/plugin-sdk/interactive-runtime";
 export const MAX_CHANNEL_ID = "max";
 export const DEFAULT_ACCOUNT_ID = "default";
 /** MAX Bot API v2 base URL (platform-api.max.ru is deprecated since 2026-07-19). */
@@ -312,6 +314,124 @@ export function resolveMaxSendOptions(cfg, channelData) {
         ...(disableLinkPreview !== undefined ? { disable_link_preview: disableLinkPreview } : {}),
     };
 }
+/** Outbound text chunk limit (mirrors the reply-path MAX_TEXT_LIMIT). */
+const MAX_OUTBOUND_TEXT_LIMIT = 4000;
+/** Shown when a payload carries only buttons and no text at all. */
+const MAX_CONTROL_ONLY_FALLBACK = "Choose an option.";
+/**
+ * Convert a portable `presentation` payload into the one MAX payload shape
+ * used by every outbound funnel (mirrors the core Telegram adapter): buttons
+ * blocks become `channelData.maxInlineKeyboard`, everything else degrades to
+ * fallback text. Called by the core via `outbound.renderPresentation` after
+ * the presentation was adapted to `presentationCapabilities` — so by this
+ * point unsupported blocks (selects, tables, …) are already text.
+ */
+export function canonicalizeMaxPresentationPayload(payload) {
+    const presentation = normalizeMessagePresentation(payload.presentation);
+    if (!presentation)
+        return payload;
+    let keyboard = null;
+    try {
+        keyboard = presentationToMaxButtons(presentation);
+    }
+    catch {
+        keyboard = null; // over-limit keyboards degrade to text-only delivery
+    }
+    const textBlocks = presentation.blocks.filter((block) => block.type !== "buttons");
+    const fallbackText = renderMessagePresentationFallbackText({
+        presentation: { ...presentation, blocks: textBlocks },
+    });
+    const currentText = payload.text?.trim() ?? "";
+    const textIsFallback = payload.presentationTextMode === "fallback";
+    const alreadyHasFallback = fallbackText.length > 0 &&
+        (currentText === fallbackText || currentText.endsWith(`\n\n${fallbackText}`));
+    const text = textIsFallback
+        ? currentText || fallbackText
+        : alreadyHasFallback
+            ? currentText
+            : [currentText, fallbackText].filter(Boolean).join("\n\n");
+    const { presentation: _presentation, presentationTextMode: _mode, ...rest } = payload;
+    return {
+        ...rest,
+        text: text || (keyboard ? MAX_CONTROL_ONLY_FALLBACK : ""),
+        ...(keyboard
+            ? { channelData: { ...(payload.channelData ?? {}), maxInlineKeyboard: keyboard } }
+            : {}),
+    };
+}
+/**
+ * Whole-payload outbound send (core `sendPayload`): taken whenever a payload
+ * carries channelData / presentation / interactive — exactly the cases the
+ * plain sendText path would silently drop. The keyboard attaches to the last
+ * text chunk; media follows without captions.
+ */
+async function sendMaxPayload(ctx) {
+    const payload = ctx.payload ?? {};
+    const bot = ensureBotForOutbound(ctx.cfg);
+    const opts = resolveMaxSendOptions(ctx.cfg, payload.channelData);
+    if (ctx.silent === true)
+        opts.notify = false;
+    let keyboardButtons = null;
+    try {
+        keyboardButtons = resolvePayloadKeyboardButtons(payload);
+    }
+    catch {
+        keyboardButtons = null; // invalid keyboard must not lose the message
+    }
+    const keyboardAttachment = keyboardButtons
+        ? toInlineKeyboardAttachment(keyboardButtons)
+        : undefined;
+    let text = (typeof payload.text === "string" && payload.text.trim()) || ctx.text.trim();
+    if (!text && keyboardAttachment)
+        text = MAX_CONTROL_ONLY_FALLBACK;
+    const replyLink = ctx.replyToId ? { link: { type: "reply", mid: String(ctx.replyToId) } } : {};
+    let lastMessageId = "";
+    if (text) {
+        const chunks = [];
+        for (let i = 0; i < text.length; i += MAX_OUTBOUND_TEXT_LIMIT) {
+            chunks.push(text.slice(i, i + MAX_OUTBOUND_TEXT_LIMIT));
+        }
+        for (let i = 0; i < chunks.length; i++) {
+            const isLast = i === chunks.length - 1;
+            const extra = {
+                format: "markdown",
+                ...opts,
+                ...(i === 0 ? replyLink : {}),
+                ...(isLast && keyboardAttachment ? { attachments: [keyboardAttachment] } : {}),
+            };
+            let sent;
+            try {
+                sent = await sendMaxMessage(bot, ctx.to, chunks[i], extra);
+            }
+            catch {
+                // invalid markdown must not lose the message
+                const { format: _format, ...plainExtra } = extra;
+                sent = await sendMaxMessage(bot, ctx.to, chunks[i], plainExtra);
+            }
+            lastMessageId = extractSentMessageId(sent);
+        }
+    }
+    const mediaUrls = [
+        ...new Set([payload.mediaUrl, ...(Array.isArray(payload.mediaUrls) ? payload.mediaUrls : [])]
+            .filter((u) => typeof u === "string" && Boolean(u.trim()))
+            .map((u) => u.trim())),
+    ];
+    for (const mediaUrl of mediaUrls) {
+        const mid = await sendMaxMedia(bot, {
+            to: ctx.to,
+            text: "",
+            mediaUrl,
+            mediaReadFile: ctx.mediaReadFile,
+            mediaLocalRoots: ctx.mediaLocalRoots ?? getAgentScopedMediaLocalRoots(ctx.cfg),
+            extra: { ...opts, ...(lastMessageId ? {} : replyLink) },
+        });
+        if (mid)
+            lastMessageId = mid;
+    }
+    if (!lastMessageId)
+        throw new Error("MAX sendPayload: nothing to send (empty text and no media)");
+    return { channel: MAX_CHANNEL_ID, messageId: lastMessageId };
+}
 let updateHandler = null;
 export function setMaxUpdateHandler(handler) {
     updateHandler = handler;
@@ -380,16 +500,17 @@ export const maxPlugin = createChatChannelPlugin({
                 "group/channel ids are negative.",
                 "Attach media via the message tool `media` param (local path or URL).",
                 "Groups: the bot may answer only when @-mentioned or replied to (requireMention config).",
-                "Inline keyboards: pass `channelData.maxInlineKeyboard` on the message tool —",
-                "an array of rows, each row an array of buttons `{text, url?, payload?}`",
-                "(url → link button, otherwise callback; payload defaults to the label) or",
-                "plain strings (callback with payload = text). Full wire buttons",
-                "`{type: \"callback\"|\"link\"|\"clipboard\", ...}` are accepted too.",
-                "Limits: ≤210 buttons, ≤30 rows, ≤7 per row (≤3 if a row has a link),",
-                "link URL ≤2048 chars. The keyboard attaches to the final reply only,",
-                "on the reply path (not via `openclaw message send`); a button press",
-                "returns as an inbound message carrying the payload (plus a quote of",
-                "the message the button was on) — make payloads self-describing.",
+                "Inline keyboards: pass `presentation` on the message tool —",
+                'presentation={"blocks": [{"type": "buttons", "buttons": [{"label": "Да", "value": "yes"},',
+                '{"label": "Link", "url": "https://…"}]}]}. Callback buttons carry `value` (or',
+                'action={"type": "callback"|"command", ...}); `url` (or action type "url") makes a link',
+                "button. The keyboard rides on the same message as the tool send. In a plain reply",
+                "channelData.maxInlineKeyboard also works: rows of `{text, url?, payload?}` buttons or",
+                "plain strings (callback with payload = text). Limits: ≤210 buttons, ≤30 rows,",
+                "≤7 per row (≤3 if a row has a link), link URL ≤2048 chars. The keyboard attaches",
+                "to the final reply message only. A button press returns as an inbound message",
+                "carrying the payload (plus a quote of the message the button was on) — make",
+                "payloads self-describing.",
                 "",
                 "### MAX message actions",
                 'Sticker: message(action="sticker", target="<chat_id>", stickerId="<code>") — codes come',
@@ -492,6 +613,42 @@ export const maxPlugin = createChatChannelPlugin({
     outbound: {
         base: {
             deliveryMode: "direct",
+            // Portable presentation (message tool `presentation` param): MAX renders
+            // button blocks natively as inline keyboards; everything else degrades
+            // to text before renderPresentation is called.
+            presentationCapabilities: {
+                supported: true,
+                buttons: true,
+                selects: false,
+                context: false,
+                divider: false,
+                charts: false,
+                tables: false,
+                limits: {
+                    actions: {
+                        maxActions: MAX_KEYBOARD_LIMITS.maxButtons,
+                        maxActionsPerRow: MAX_PRESENTATION_ROW_SIZE,
+                        maxRows: MAX_KEYBOARD_LIMITS.maxRows,
+                        supportsStyles: false,
+                        supportsDisabled: false,
+                        supportsLayoutHints: false,
+                    },
+                },
+            },
+            renderPresentation: ({ payload }) => canonicalizeMaxPresentationPayload(payload),
+            // Payloads carrying channelData / presentation / interactive are routed
+            // here by the core — sendText alone would silently drop the keyboard.
+            sendPayload: sendMaxPayload,
+            deliveryCapabilities: {
+                durableFinal: {
+                    text: true,
+                    media: true,
+                    payload: true,
+                    silent: true,
+                    replyTo: true,
+                    messageSendingHooks: true,
+                },
+            },
         },
         attachedResults: {
             channel: MAX_CHANNEL_ID,

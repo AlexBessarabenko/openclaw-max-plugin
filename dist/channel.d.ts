@@ -1,6 +1,7 @@
 import type { OpenClawConfig } from "openclaw/plugin-sdk/channel-core";
 import type { ChannelMessagingAdapter } from "openclaw/plugin-sdk/core";
 import { Bot } from "@maxhub/max-bot-api";
+import type { ReplyPayload } from "openclaw/plugin-sdk/reply-payload";
 export declare const MAX_CHANNEL_ID = "max";
 export declare const DEFAULT_ACCOUNT_ID = "default";
 /** MAX Bot API v2 base URL (platform-api.max.ru is deprecated since 2026-07-19). */
@@ -113,6 +114,15 @@ export declare function resolveMaxSendOptions(cfg: OpenClawConfig, channelData?:
     notify?: boolean;
     disable_link_preview?: boolean;
 };
+/**
+ * Convert a portable `presentation` payload into the one MAX payload shape
+ * used by every outbound funnel (mirrors the core Telegram adapter): buttons
+ * blocks become `channelData.maxInlineKeyboard`, everything else degrades to
+ * fallback text. Called by the core via `outbound.renderPresentation` after
+ * the presentation was adapted to `presentationCapabilities` — so by this
+ * point unsupported blocks (selects, tables, …) are already text.
+ */
+export declare function canonicalizeMaxPresentationPayload(payload: ReplyPayload): ReplyPayload;
 type InboundUpdateHandler = (update: any, token: string) => Promise<void>;
 export declare function setMaxUpdateHandler(handler: InboundUpdateHandler): void;
 /**

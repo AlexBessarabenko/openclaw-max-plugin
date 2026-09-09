@@ -51,6 +51,7 @@ describe("describeMessageTool", () => {
   it("lists channel actions only when the token is configured", () => {
     expect(maxMessageActions.describeMessageTool?.({ cfg: makeCfg("t") })).toEqual({
       actions: ["edit", "delete", "pin", "unpin", "sticker", "sendAttachment"],
+      capabilities: ["presentation"],
     });
     expect(maxMessageActions.describeMessageTool?.({ cfg: makeCfg() })).toBeNull();
   });
