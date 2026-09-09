@@ -8,6 +8,7 @@ import { downloadRemoteMedia, MAX_ATTACHMENT_BYTES, MAX_INBOUND_ATTACHMENTS, } f
 import { createMaxSendFileTool } from "./src/send-file-tool.js";
 import { isDuplicate } from "./src/dedup.js";
 import { rememberStickerCode } from "./src/stickers.js";
+import { groupChatAdmission } from "./src/chat-policy.js";
 import { resolveDmGroupAccessWithLists } from "openclaw/plugin-sdk/channel-policy";
 import { createChannelPairingController } from "openclaw/plugin-sdk/channel-pairing";
 /** MAX caps message text at 4000 chars. */
@@ -856,15 +857,13 @@ async function checkGroupAccess(api, facts) {
         api.logger.info(`[MAX] group message dropped: ${reason} (chat=${facts.chatId})`);
         return false;
     };
+    const admission = groupChatAdmission(cfg, facts.chatId);
+    if (!admission.admitted)
+        return drop(admission.reason);
     const groupPolicy = section.groupPolicy ?? "open";
-    if (groupPolicy === "disabled")
-        return drop("groupPolicy=disabled");
     const groups = section.groups ?? {};
     const groupCfg = groups[facts.chatId] ?? groups["*"];
     if (groupPolicy === "allowlist") {
-        if (!(facts.chatId in groups) && !("*" in groups)) {
-            return drop("chat not in groups allowlist");
-        }
         const groupAllowFrom = section.groupAllowFrom ?? [];
         if (groupAllowFrom.length > 0) {
             const allowed = groupAllowFrom.some((entry) => normalizeMaxTarget(String(entry)).replace(/^user:/i, "") === String(facts.senderId));
@@ -872,8 +871,6 @@ async function checkGroupAccess(api, facts) {
                 return drop("sender not in groupAllowFrom");
         }
     }
-    if (groupCfg?.enabled === false)
-        return drop("group disabled via groups config");
     const requireMention = typeof groupCfg?.requireMention === "boolean"
         ? groupCfg.requireMention
         : typeof section.requireMention === "boolean"

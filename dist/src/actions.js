@@ -34,6 +34,88 @@ import { jsonResult } from "openclaw/plugin-sdk/agent-runtime";
 import { readStringParam } from "openclaw/plugin-sdk/param-readers";
 import { MAX_CHANNEL_ID, ensureBotForOutbound, normalizeMaxTarget, resolveAccount, sendMaxBody, } from "../channel.js";
 import { getLastStickerCode } from "./stickers.js";
+import { groupChatAdmission } from "./chat-policy.js";
+/**
+ * Moderation-action scoping (0.5.3): actions may target DMs freely (the bot
+ * can only touch its own messages there) but GROUP chats only when admitted
+ * by the channels.max group policy — a prompt injection in one chat must not
+ * reach another chat the bot sits in.
+ *
+ * Chat typing uses the MAX id convention the plugin already relies on
+ * (maxMessaging.inferTargetChatType, agentPrompt): dialog chat ids are
+ * positive, group/channel ids are negative — so explicit chat targets need
+ * no API call. edit/delete carry only a messageId; the chat is resolved via
+ * GET /messages/{mid} (bot.api.getMessage → recipient.{chat_id, chat_type})
+ * and cached process-lifetime (a mid never changes chats). Resolution
+ * failures are fail-closed: the action is refused.
+ */
+/** mid → message chat, process-lifetime (immutable mapping). */
+const messageChatCache = new Map();
+const MESSAGE_CHAT_CACHE_MAX = 1000;
+export function resetActionChatCachesForTest() {
+    messageChatCache.clear();
+}
+/** Dialog chat ids are positive by MAX convention; groups must be admitted. */
+function assertChatIdAdmitted(cfg, chatId, action) {
+    if (chatId >= 0)
+        return;
+    const admission = groupChatAdmission(cfg, chatId);
+    if (!admission.admitted) {
+        throw new Error(`${action}: chat ${chatId} is not admitted by the channels.max group policy (${admission.reason})`);
+    }
+}
+/** Gate for actions with an explicit target (pin/unpin/sticker/sendAttachment). */
+function assertActionTargetAdmitted(cfg, rawTo, action) {
+    const t = normalizeMaxTarget(rawTo);
+    if (/^user:/i.test(t))
+        return; // DM target — always admitted
+    const chatId = Number(t);
+    if (!Number.isFinite(chatId))
+        return; // invalid target: downstream validation errors
+    assertChatIdAdmitted(cfg, chatId, action);
+}
+/** Gate for edit/delete: resolve the message's chat, then apply the policy. */
+async function assertMessageActionAdmitted(cfg, bot, messageId, action) {
+    let info = messageChatCache.get(messageId);
+    if (!info) {
+        let msg;
+        try {
+            msg = await bot.api.getMessage(messageId);
+        }
+        catch (err) {
+            throw new Error(`${action}: cannot resolve the chat of message ${messageId}; refusing to run ` +
+                `(fail-closed): ${err?.message ?? err}`);
+        }
+        info = {
+            chatId: typeof msg?.recipient?.chat_id === "number" ? msg.recipient.chat_id : null,
+            chatType: typeof msg?.recipient?.chat_type === "string" ? msg.recipient.chat_type : null,
+        };
+        if (messageChatCache.size >= MESSAGE_CHAT_CACHE_MAX) {
+            messageChatCache.delete(messageChatCache.keys().next().value);
+        }
+        messageChatCache.set(messageId, info);
+    }
+    if (info.chatType === "dialog")
+        return;
+    if (info.chatType === "chat" || info.chatType === "channel") {
+        // A known group/channel: apply the policy even if the id sign convention
+        // were to break (positive id) — the explicit type wins.
+        if (info.chatId == null) {
+            throw new Error(`${action}: message ${messageId} is in a ${info.chatType} without a resolvable chat id; refusing to run (fail-closed)`);
+        }
+        const admission = groupChatAdmission(cfg, info.chatId);
+        if (!admission.admitted) {
+            throw new Error(`${action}: chat ${info.chatId} is not admitted by the channels.max group policy (${admission.reason})`);
+        }
+        return;
+    }
+    // chat_type unavailable — conservative fallback: unclassifiable messages are
+    // refused; otherwise the id-sign convention classifies (positive = dialog).
+    if (info.chatId == null) {
+        throw new Error(`${action}: message ${messageId} has no resolvable chat; refusing to run (fail-closed)`);
+    }
+    assertChatIdAdmitted(cfg, info.chatId, action);
+}
 /** Placeholder target so edit/delete (messageId-only) still route to MAX. */
 const MESSAGE_ACTION_PLACEHOLDER = "__message_action__";
 const SUPPORTED_ACTIONS = ["edit", "delete", "pin", "unpin", "sticker", "sendAttachment"];
@@ -144,6 +226,7 @@ export const maxMessageActions = {
         if (action === "edit") {
             const messageId = readStringParam(params, "messageId", { required: true });
             const text = readStringParam(params, "message", { required: true, allowEmpty: true });
+            await assertMessageActionAdmitted(cfg, bot, messageId, action);
             try {
                 await bot.api.editMessage(messageId, { text, format: "markdown" });
             }
@@ -156,6 +239,7 @@ export const maxMessageActions = {
         }
         if (action === "delete") {
             const messageId = readStringParam(params, "messageId", { required: true });
+            await assertMessageActionAdmitted(cfg, bot, messageId, action);
             try {
                 await bot.api.deleteMessage(messageId);
             }
@@ -169,6 +253,7 @@ export const maxMessageActions = {
         if (action === "pin" || action === "unpin") {
             const to = stripTargetPrefix(readStringParam(params, "to") ?? readStringParam(params, "target", { required: true }));
             const chatId = resolveChatId(to, action);
+            assertChatIdAdmitted(cfg, chatId, action);
             if (action === "pin") {
                 const messageId = readStringParam(params, "messageId", { required: true });
                 // notify defaults to server behavior (members get notified); pass only
@@ -200,6 +285,7 @@ export const maxMessageActions = {
             const to = stripTargetPrefix(readStringParam(params, "to") ?? readStringParam(params, "target", { required: true }));
             const replyTo = readStringParam(params, "replyTo");
             const stickerCode = resolveStickerCode(params.stickerId, normalizeMaxTarget(to));
+            assertActionTargetAdmitted(cfg, to, action);
             if (!stickerCode) {
                 throw new Error("stickerId is required: pass a sticker code, or receive a sticker in this " +
                     "chat first (only stickers the bot has seen can be resent)");
@@ -215,6 +301,7 @@ export const maxMessageActions = {
             const replyTo = readStringParam(params, "replyTo");
             const caption = readStringParam(params, "message") ?? readStringParam(params, "caption") ?? "";
             const attachType = readStringParam(params, "type") ?? readStringParam(params, "attachmentType") ?? "";
+            assertActionTargetAdmitted(cfg, to, action);
             // Native location pin (coordinates are top-level, not in payload)
             const location = parseLocation(params);
             if (attachType === "location" || location) {

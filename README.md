@@ -352,6 +352,17 @@ message(action="sendAttachment", type="contact",  target="<chat_id>", contactId=
   `replyTo` (a message id) is supported on sticker/location/contact sends.
 - **Contacts** use the snake_case wire payload (`vcf_info` VCard signed with an
   HMAC of the bot token, or `max_info` for a MAX user id).
+- **Chat scoping (since 0.5.3):** these moderation actions may target dialogs
+  (DMs) freely, but a **group/channel chat only when it is admitted by the
+  group policy** (`groupPolicy` / `groups`, same rules as the inbound gate) —
+  a prompt injection in one chat cannot reach another chat the bot sits in.
+  `edit`/`delete` carry only a `messageId`, so the chat is resolved via
+  `GET /messages/{mid}` (`recipient.chat_type`/`chat_id`, cached for the
+  process lifetime); if the chat cannot be resolved the action is refused
+  (fail-closed). Explicit chat targets are classified by the MAX id
+  convention (dialog ids positive, group/channel ids negative) — no extra API
+  calls. A rejected action fails with `chat … is not admitted by the
+  channels.max group policy`.
 
 ### Sending files (`max_send_file` tool)
 

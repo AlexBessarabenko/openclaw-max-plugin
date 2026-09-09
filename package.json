@@ -1,6 +1,6 @@
 {
   "name": "@alexbessarabenko/openclaw-max",
-  "version": "0.5.2",
+  "version": "0.5.3",
   "description": "MAX messenger channel plugin for OpenClaw",
   "license": "MIT",
   "type": "module",
@@ -40,6 +40,7 @@
     "src/polling-state.ts",
     "src/actions.ts",
     "src/stickers.ts",
+    "src/chat-policy.ts",
     "openclaw.plugin.json",
     "README.md",
     "CHANGELOG.md",

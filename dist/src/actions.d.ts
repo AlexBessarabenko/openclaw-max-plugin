@@ -30,5 +30,6 @@
  *              data=vcf_info) hex.
  */
 import type { ChannelMessageActionAdapter } from "openclaw/plugin-sdk/channel-contract";
+export declare function resetActionChatCachesForTest(): void;
 export declare const maxMessageActions: ChannelMessageActionAdapter;
 //# sourceMappingURL=actions.d.ts.map

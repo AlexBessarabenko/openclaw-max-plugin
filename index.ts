@@ -16,6 +16,7 @@ import {
 import { createMaxSendFileTool } from "./src/send-file-tool.js";
 import { isDuplicate } from "./src/dedup.js";
 import { rememberStickerCode } from "./src/stickers.js";
+import { groupChatAdmission } from "./src/chat-policy.js";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk/channel-core";
 import { resolveDmGroupAccessWithLists } from "openclaw/plugin-sdk/channel-policy";
 import { createChannelPairingController } from "openclaw/plugin-sdk/channel-pairing";
@@ -959,15 +960,13 @@ async function checkGroupAccess(api: OpenClawPluginApi, facts: InboundFacts): Pr
     return false;
   };
 
-  const groupPolicy: string = section.groupPolicy ?? "open";
-  if (groupPolicy === "disabled") return drop("groupPolicy=disabled");
+  const admission = groupChatAdmission(cfg, facts.chatId);
+  if (!admission.admitted) return drop(admission.reason);
 
+  const groupPolicy: string = section.groupPolicy ?? "open";
   const groups: Record<string, any> = section.groups ?? {};
   const groupCfg = groups[facts.chatId] ?? groups["*"];
   if (groupPolicy === "allowlist") {
-    if (!(facts.chatId in groups) && !("*" in groups)) {
-      return drop("chat not in groups allowlist");
-    }
     const groupAllowFrom: Array<string | number> = section.groupAllowFrom ?? [];
     if (groupAllowFrom.length > 0) {
       const allowed = groupAllowFrom.some(
@@ -977,8 +976,6 @@ async function checkGroupAccess(api: OpenClawPluginApi, facts: InboundFacts): Pr
       if (!allowed) return drop("sender not in groupAllowFrom");
     }
   }
-
-  if (groupCfg?.enabled === false) return drop("group disabled via groups config");
 
   const requireMention: boolean =
     typeof groupCfg?.requireMention === "boolean"

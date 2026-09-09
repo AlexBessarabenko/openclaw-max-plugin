@@ -16,6 +16,8 @@ const fakeBot = {
     deleteMessage: vi.fn(),
     pinMessage: vi.fn(),
     unpinMessage: vi.fn(),
+    // edit/delete chat resolution (GET /messages/{mid})
+    getMessage: vi.fn(),
     raw: {
       messages: {
         // sendMaxBody send path (stickers, locations, contacts)
@@ -32,11 +34,11 @@ vi.mock("../channel.js", async (importOriginal) => {
   return { ...actual, ensureBotForOutbound: () => fakeBot as any };
 });
 
-import { maxMessageActions } from "./actions.js";
+import { maxMessageActions, resetActionChatCachesForTest } from "./actions.js";
 
-function makeCfg(token?: string): OpenClawConfig {
+function makeCfg(token?: string, sectionExtra?: Record<string, unknown>): OpenClawConfig {
   return {
-    channels: { max: token ? { token } : {} },
+    channels: { max: token ? { token, ...sectionExtra } : { ...sectionExtra } },
   } as unknown as OpenClawConfig;
 }
 
@@ -45,6 +47,12 @@ const CTX = { cfg: makeCfg("test-token"), accountId: undefined };
 beforeEach(() => {
   vi.clearAllMocks();
   resetStickerCacheForTest();
+  resetActionChatCachesForTest();
+  // Default: messages resolve to a dialog (DM), which is always admitted.
+  fakeBot.api.getMessage.mockResolvedValue({
+    recipient: { chat_id: 5050, chat_type: "dialog" },
+    body: { mid: "m-x" },
+  });
 });
 
 describe("describeMessageTool", () => {
@@ -353,5 +361,142 @@ describe("handleAction: unknown", () => {
         ...CTX,
       } as any),
     ).rejects.toThrow(/not supported for provider max/);
+  });
+});
+
+describe("handleAction: chat policy scoping", () => {
+  const allowlistCfg = {
+    cfg: makeCfg("test-token", {
+      groupPolicy: "allowlist",
+      groups: { "-900100": {} },
+    }),
+    accountId: undefined,
+  };
+
+  it("rejects pin in a group not admitted by the allowlist policy", async () => {
+    await expect(
+      maxMessageActions.handleAction!({
+        action: "pin",
+        params: { target: "-900200", messageId: "m-p1" },
+        ...allowlistCfg,
+      } as any),
+    ).rejects.toThrow(/not admitted by the channels\.max group policy/);
+    expect(fakeBot.api.pinMessage).not.toHaveBeenCalled();
+  });
+
+  it("allows pin in a group listed in groups", async () => {
+    fakeBot.api.pinMessage.mockResolvedValueOnce({});
+    const res = await maxMessageActions.handleAction!({
+      action: "pin",
+      params: { target: "-900100", messageId: "m-p2" },
+      ...allowlistCfg,
+    } as any);
+
+    expect(fakeBot.api.pinMessage).toHaveBeenCalledWith(-900100, "m-p2", undefined);
+    expect(res.details).toEqual({ ok: true, to: "-900100", messageId: "m-p2" });
+  });
+
+  it("allows group actions under groupPolicy=open without any chat-type API call", async () => {
+    fakeBot.api.pinMessage.mockResolvedValueOnce({});
+    await maxMessageActions.handleAction!({
+      action: "pin",
+      params: { target: "-900200", messageId: "m-p3" },
+      ...CTX, // default cfg: no groupPolicy → open
+    } as any);
+
+    expect(fakeBot.api.pinMessage).toHaveBeenCalledWith(-900200, "m-p3", undefined);
+    // explicit chat targets are classified by id sign — no getChat/getMessage
+    expect(fakeBot.api.getMessage).not.toHaveBeenCalled();
+  });
+
+  it("allows edit when the message resolves to a dialog", async () => {
+    fakeBot.api.editMessage.mockResolvedValueOnce({});
+    await maxMessageActions.handleAction!({
+      action: "edit",
+      params: { messageId: "m-e1", message: "fixed" },
+      ...allowlistCfg,
+    } as any);
+
+    expect(fakeBot.api.getMessage).toHaveBeenCalledWith("m-e1");
+    expect(fakeBot.api.editMessage).toHaveBeenCalledWith("m-e1", {
+      text: "fixed",
+      format: "markdown",
+    });
+  });
+
+  it("rejects edit when the message resolves to a group outside the policy", async () => {
+    fakeBot.api.getMessage.mockResolvedValueOnce({
+      recipient: { chat_id: -900200, chat_type: "chat" },
+      body: { mid: "m-e2" },
+    });
+    await expect(
+      maxMessageActions.handleAction!({
+        action: "edit",
+        params: { messageId: "m-e2", message: "x" },
+        ...allowlistCfg,
+      } as any),
+    ).rejects.toThrow(/not admitted by the channels\.max group policy/);
+    expect(fakeBot.api.editMessage).not.toHaveBeenCalled();
+  });
+
+  it("caches mid → chat resolution (second edit without another getMessage)", async () => {
+    fakeBot.api.editMessage.mockResolvedValue({});
+    await maxMessageActions.handleAction!({
+      action: "edit",
+      params: { messageId: "m-c1", message: "one" },
+      ...CTX,
+    } as any);
+    await maxMessageActions.handleAction!({
+      action: "edit",
+      params: { messageId: "m-c1", message: "two" },
+      ...CTX,
+    } as any);
+
+    expect(fakeBot.api.getMessage).toHaveBeenCalledTimes(1);
+    expect(fakeBot.api.editMessage).toHaveBeenCalledTimes(2);
+  });
+
+  it("fails closed when the message chat cannot be resolved", async () => {
+    fakeBot.api.getMessage.mockRejectedValueOnce(new Error("network down"));
+    await expect(
+      maxMessageActions.handleAction!({
+        action: "delete",
+        params: { messageId: "m-x1" },
+        ...CTX,
+      } as any),
+    ).rejects.toThrow(/fail-closed/);
+    expect(fakeBot.api.deleteMessage).not.toHaveBeenCalled();
+  });
+
+  it("rejects sticker and sendAttachment in a group outside the policy", async () => {
+    await expect(
+      maxMessageActions.handleAction!({
+        action: "sticker",
+        params: { target: "-900200", stickerId: "code1" },
+        ...allowlistCfg,
+      } as any),
+    ).rejects.toThrow(/not admitted by the channels\.max group policy/);
+
+    await expect(
+      maxMessageActions.handleAction!({
+        action: "sendAttachment",
+        params: { target: "-900200", type: "location", latitude: "55.75", longitude: "37.62" },
+        ...allowlistCfg,
+      } as any),
+    ).rejects.toThrow(/not admitted by the channels\.max group policy/);
+
+    expect(fakeBot.api.raw.messages.send).not.toHaveBeenCalled();
+  });
+
+  it("rejects every group when groupPolicy=disabled", async () => {
+    await expect(
+      maxMessageActions.handleAction!({
+        action: "unpin",
+        params: { target: "-900100" },
+        cfg: makeCfg("test-token", { groupPolicy: "disabled", groups: { "-900100": {} } }),
+        accountId: undefined,
+      } as any),
+    ).rejects.toThrow(/not admitted.*groupPolicy=disabled/);
+    expect(fakeBot.api.unpinMessage).not.toHaveBeenCalled();
   });
 });

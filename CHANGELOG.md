@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.3] - 2026-09-09
+
+### Security
+
+- **Moderation message actions are now scoped to policy-admitted chats.**
+  `edit` / `delete` / `pin` / `unpin` / `sticker` / `sendAttachment` could
+  previously target ANY chat the bot sits in, so a prompt injection in one
+  chat could act on another. Dialogs (DMs) stay open; group/channel chats
+  must pass the channel's group policy (`groupPolicy` / `groups`, shared with
+  the inbound gate via `src/chat-policy.ts`). `edit`/`delete` resolve the
+  message's chat via `GET /messages/{mid}` (`recipient.chat_type`/`chat_id`,
+  cached per process) and refuse to run when the chat cannot be resolved
+  (fail-closed). Explicit chat targets are typed by the MAX id convention
+  (positive = dialog, negative = group/channel) without extra API calls.
+
 ## [0.5.2] - 2026-09-09
 
 ### Added
@@ -118,6 +133,7 @@ Tested with OpenClaw **2026.9.3**.
 - **Agent prompt hints** — MAX Markdown rules, 4000-char limit and target syntax are
   taught to the agent via `agentPrompt`.
 
+[0.5.3]: https://github.com/AlexBessarabenko/openclaw-max-plugin/compare/v0.5.2...v0.5.3
 [0.5.2]: https://github.com/AlexBessarabenko/openclaw-max-plugin/compare/v0.5.1...v0.5.2
 [0.5.1]: https://github.com/AlexBessarabenko/openclaw-max-plugin/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/AlexBessarabenko/openclaw-max-plugin/compare/v0.4.0...v0.5.0
