@@ -1,14 +1,18 @@
 {
   "id": "max",
   "kind": "channel",
-  "channels": ["max"],
+  "channels": [
+    "max"
+  ],
   "name": "MAX Messenger",
   "description": "MAX Messenger channel plugin for OpenClaw",
   "activation": {
     "onStartup": true
   },
   "contracts": {
-    "tools": ["max_send_file"]
+    "tools": [
+      "max_send_file"
+    ]
   },
   "configSchema": {
     "type": "object",
@@ -20,40 +24,78 @@
       "schema": {
         "type": "object",
         "properties": {
-          "token": { "type": "string" },
+          "token": {
+            "type": "string"
+          },
           "allowFrom": {
             "type": "array",
-            "items": { "type": "string" }
+            "items": {
+              "type": "string"
+            }
           },
           "dmPolicy": {
             "type": "string",
-            "enum": ["open", "allowlist", "closed"]
+            "enum": [
+              "open",
+              "allowlist",
+              "closed"
+            ]
           },
-          "webhookUrl": { "type": "string" },
-          "webhookSecret": { "type": "string" },
-          "apiBaseUrl": { "type": "string" },
-          "httpProxy": { "type": "string" },
-          "streaming": { "type": "boolean" },
+          "webhookUrl": {
+            "type": "string"
+          },
+          "webhookSecret": {
+            "type": "string"
+          },
+          "apiBaseUrl": {
+            "type": "string"
+          },
+          "httpProxy": {
+            "type": "string"
+          },
+          "streaming": {
+            "type": "boolean"
+          },
           "groupPolicy": {
             "type": "string",
-            "enum": ["open", "allowlist", "disabled"]
+            "enum": [
+              "open",
+              "allowlist",
+              "disabled"
+            ]
           },
           "groupAllowFrom": {
             "type": "array",
-            "items": { "type": "string" }
+            "items": {
+              "type": "string"
+            }
           },
-          "requireMention": { "type": "boolean" },
-          "notify": { "type": "boolean" },
-          "disableLinkPreview": { "type": "boolean" },
+          "requireMention": {
+            "type": "boolean"
+          },
+          "notify": {
+            "type": "boolean"
+          },
+          "disableLinkPreview": {
+            "type": "boolean"
+          },
           "groups": {
             "type": "object",
             "additionalProperties": {
               "type": "object",
               "properties": {
-                "requireMention": { "type": "boolean" },
-                "enabled": { "type": "boolean" }
+                "requireMention": {
+                  "type": "boolean"
+                },
+                "enabled": {
+                  "type": "boolean"
+                }
               }
             }
+          },
+          "logInboundPreview": {
+            "type": "boolean",
+            "description": "Log a 50-char preview of inbound message text (default: metadata only)"
           }
         }
       },

@@ -95,6 +95,7 @@ npm run build
 | `groups` | Per-group overrides keyed by chat id (or `"*"`): `{ "requireMention": bool, "enabled": bool }` |
 | `notify` | Channel default for outbound notifications; `false` = send silently. Per-message override: `channelData.maxNotify` |
 | `disableLinkPreview` | Channel default for suppressing link previews. Per-message override: `channelData.maxDisableLinkPreview` |
+| `logInboundPreview` | `false` (default) — the inbound log line carries metadata only (chat, type, sender, text length); `true` adds a 50-char text preview for debugging |
 | `webhookUrl` | Public URL of the `/max/webhook` route. When set, the plugin subscribes via `POST /subscriptions` automatically. When empty — long polling |
 | `webhookSecret` | Optional secret; verified against the `X-Max-Bot-Api-Secret` header |
 | `apiBaseUrl` | API override, default `https://platform-api2.max.ru` |

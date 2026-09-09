@@ -102,6 +102,23 @@ beforeEach(() => {
   sendMaxMediaMock.mockResolvedValue("media-mid-1");
 });
 
+describe("inbound logging", () => {
+  it("logs metadata only by default (no text preview)", async () => {
+    const { api } = makeApi();
+    await handleUpdate(api as any, messageCreatedUpdate("m-log1"), "tok");
+    const line = api.logger.info.mock.calls.map((c) => String(c[0])).find((m) => m.includes("[MAX] inbound"));
+    expect(line).toContain("chars=6");
+    expect(line).not.toContain("привет");
+  });
+
+  it("logs a text preview when channels.max.logInboundPreview is true", async () => {
+    const { api } = makeApi({ channels: { max: { dmPolicy: "open", logInboundPreview: true } } });
+    await handleUpdate(api as any, messageCreatedUpdate("m-log2"), "tok");
+    const line = api.logger.info.mock.calls.map((c) => String(c[0])).find((m) => m.includes("[MAX] inbound"));
+    expect(line).toContain('preview="привет"');
+  });
+});
+
 describe("deliver with media payloads", () => {
   it("sends voice (TTS) payloads as audio only — no text copy", async () => {
     const captured = await setupDispatchedTurn("m-md1");

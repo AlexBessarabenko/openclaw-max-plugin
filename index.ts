@@ -460,8 +460,13 @@ async function runInbound(api: OpenClawPluginApi, facts: InboundFacts, token: st
   const { text, media } = await buildTextAndMedia(api, facts, token);
   const { chatId, senderId, senderName, isGroup } = facts;
 
+  // Inbound log is metadata-only by default; channels.max.logInboundPreview
+  // opts back into a 50-char text preview for debugging.
+  const logInboundPreview =
+    (api as any).runtime?.config?.current?.()?.channels?.[MAX_CHANNEL_ID]?.logInboundPreview === true;
   api.logger.info(
-    `[MAX] inbound: chat=${chatId} type=${isGroup ? "group" : "direct"} from=${senderId} chars=${text.length}`
+    `[MAX] inbound: chat=${chatId} type=${isGroup ? "group" : "direct"} from=${senderId}` +
+      (logInboundPreview ? ` preview="${text.substring(0, 50)}"` : ` chars=${text.length}`)
   );
 
   await rt.inbound.run({
