@@ -461,7 +461,7 @@ async function runInbound(api: OpenClawPluginApi, facts: InboundFacts, token: st
   const { chatId, senderId, senderName, isGroup } = facts;
 
   api.logger.info(
-    `[MAX] inbound: chat=${chatId} type=${isGroup ? "group" : "direct"} from=${senderId} preview="${text.substring(0, 50)}"`
+    `[MAX] inbound: chat=${chatId} type=${isGroup ? "group" : "direct"} from=${senderId} chars=${text.length}`
   );
 
   await rt.inbound.run({

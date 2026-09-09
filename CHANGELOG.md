@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.1] - 2026-09-09
+
+### Changed
+
+- The inbound info log no longer includes a message-text preview — only chat id,
+  chat type, sender id and text length are logged (`[MAX] inbound: chat=…
+  type=… from=… chars=…`), so message content stays out of the gateway log.
+
 ## [0.5.0] - 2026-09-08
 
 Tested with OpenClaw **2026.9.3**.
@@ -102,5 +110,6 @@ Tested with OpenClaw **2026.9.3**.
 - **Agent prompt hints** — MAX Markdown rules, 4000-char limit and target syntax are
   taught to the agent via `agentPrompt`.
 
+[0.5.1]: https://github.com/AlexBessarabenko/openclaw-max-plugin/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/AlexBessarabenko/openclaw-max-plugin/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/AlexBessarabenko/openclaw-max-plugin/releases/tag/v0.4.0

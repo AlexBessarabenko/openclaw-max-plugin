@@ -381,7 +381,7 @@ async function runInbound(api, facts, token) {
     }
     const { text, media } = await buildTextAndMedia(api, facts, token);
     const { chatId, senderId, senderName, isGroup } = facts;
-    api.logger.info(`[MAX] inbound: chat=${chatId} type=${isGroup ? "group" : "direct"} from=${senderId} preview="${text.substring(0, 50)}"`);
+    api.logger.info(`[MAX] inbound: chat=${chatId} type=${isGroup ? "group" : "direct"} from=${senderId} chars=${text.length}`);
     await rt.inbound.run({
         channel: MAX_CHANNEL_ID,
         accountId: DEFAULT_ACCOUNT_ID,
