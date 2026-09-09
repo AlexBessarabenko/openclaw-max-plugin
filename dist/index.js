@@ -1,25 +1,16 @@
 import { timingSafeEqual } from "node:crypto";
 import { defineChannelPluginEntry } from "openclaw/plugin-sdk/channel-core";
-import { createTypingCallbacks } from "openclaw/plugin-sdk/channel-reply-pipeline";
-import { getBot, getMaxFetch, maxPlugin, runOutsideInheritedRootWork, setMaxUpdateHandler, DEFAULT_ACCOUNT_ID, MAX_CHANNEL_ID } from "./channel.js";
+import { createTypingCallbacks } from "openclaw/plugin-sdk/channel-outbound";
+import { getBot, getMaxFetch, maxPlugin, normalizeMaxTarget, runOutsideInheritedRootWork, setMaxUpdateHandler, resolveGroupPolicyWarning, resolveMaxSendOptions, DEFAULT_ACCOUNT_ID, MAX_CHANNEL_ID } from "./channel.js";
+import { resolveReplyKeyboardButtons, toInlineKeyboardAttachment, } from "./src/keyboards.js";
+import { downloadRemoteMedia, MAX_ATTACHMENT_BYTES, MAX_INBOUND_ATTACHMENTS, } from "./src/media-access.js";
+import { createMaxSendFileTool } from "./src/send-file-tool.js";
+import { isDuplicate } from "./src/dedup.js";
+import { rememberStickerCode } from "./src/stickers.js";
+import { resolveDmGroupAccessWithLists } from "openclaw/plugin-sdk/channel-policy";
+import { createChannelPairingController } from "openclaw/plugin-sdk/channel-pairing";
 /** MAX caps message text at 4000 chars. */
 const MAX_TEXT_LIMIT = 4000;
-// Deduplication: messageId → timestamp (TTL 5 min)
-const seenMessages = new Map();
-const DEDUP_TTL_MS = 5 * 60 * 1000;
-function isDuplicate(messageId) {
-    const now = Date.now();
-    for (const [id, ts] of seenMessages.entries()) {
-        if (now - ts > DEDUP_TTL_MS) {
-            seenMessages.delete(id);
-        }
-    }
-    if (seenMessages.has(messageId)) {
-        return true;
-    }
-    seenMessages.set(messageId, now);
-    return false;
-}
 function chunkText(text, limit) {
     const chunks = [];
     for (let i = 0; i < text.length; i += limit) {
@@ -27,10 +18,25 @@ function chunkText(text, limit) {
     }
     return chunks.length > 0 ? chunks : [""];
 }
+/**
+ * Mids of our own streaming-draft messages. MAX echoes the bot's edits back as
+ * message_edited updates; without this filter every draft edit would re-enter
+ * the inbound pipeline and loop the agent.
+ */
+const ownDraftMids = new Set();
+const OWN_DRAFT_MIDS_LIMIT = 1000;
+function noteOwnDraftMid(mid) {
+    if (!mid)
+        return;
+    if (ownDraftMids.size >= OWN_DRAFT_MIDS_LIMIT)
+        ownDraftMids.clear();
+    ownDraftMids.add(mid);
+}
 /** Normalize a raw MAX update (webhook or polling) into inbound facts. */
 function extractInboundFacts(update) {
     const type = update?.update_type;
-    if (type === "message_created" && update.message) {
+    if ((type === "message_created" || type === "message_edited") && update.message) {
+        const isEdit = type === "message_edited";
         const m = update.message;
         const sender = m.sender ?? {};
         const recipient = m.recipient ?? {};
@@ -38,6 +44,11 @@ function extractInboundFacts(update) {
         const chatId = recipient.chat_id ?? m.chat_id ?? update.chat_id;
         const senderId = sender.user_id ?? m.sender_id;
         if (chatId == null || senderId == null)
+            return null;
+        const rawMid = body.mid ?? m.id;
+        // Our own streaming-draft edits echo back as message_edited — drop them
+        // (a non-bot sender with a known draft mid is still our own edit).
+        if (isEdit && rawMid != null && ownDraftMids.has(String(rawMid)))
             return null;
         const senderName = sender.name ||
             [sender.first_name, sender.last_name].filter(Boolean).join(" ") ||
@@ -52,6 +63,10 @@ function extractInboundFacts(update) {
             ? link.sender?.name ||
                 [link.sender?.first_name, link.sender?.last_name].filter(Boolean).join(" ")
             : "";
+        const replyToSender = link?.type === "reply"
+            ? { replyToSenderId: link.sender?.user_id != null ? String(link.sender.user_id) : undefined,
+                replyToSenderIsBot: Boolean(link.sender?.is_bot) }
+            : {};
         if (link?.type === "forward") {
             if (!text && linkBody.text)
                 text = linkBody.text;
@@ -70,6 +85,23 @@ function extractInboundFacts(update) {
                 : `[Reply to ${linkSenderName || "unknown"}]`;
             text = text ? `${marker}\n${text}` : marker;
         }
+        if (isEdit) {
+            // The event carries the full new text (no refetch needed). The unique
+            // suffix keeps the edit from being swallowed by mid dedup.
+            const editedTs = m.timestamp ?? update.timestamp ?? Date.now();
+            return {
+                messageId: `${rawMid ?? `${chatId}:${body.seq ?? editedTs}`}_edited_${editedTs}`,
+                text: text ? `[Edited]\n${text}` : "[Edited]",
+                senderId: String(senderId),
+                senderName,
+                senderIsBot: Boolean(sender.is_bot),
+                chatId: String(chatId),
+                isGroup: (recipient.chat_type ?? m.chat_type ?? "dialog") !== "dialog",
+                timestamp: m.timestamp ?? update.timestamp,
+                attachments,
+                ...replyToSender,
+            };
+        }
         return {
             messageId: String(body.mid ?? m.id ?? `${chatId}:${body.seq ?? m.timestamp ?? Date.now()}`),
             text,
@@ -80,6 +112,7 @@ function extractInboundFacts(update) {
             isGroup: (recipient.chat_type ?? m.chat_type ?? "dialog") !== "dialog",
             timestamp: m.timestamp,
             attachments,
+            ...replyToSender,
         };
     }
     // "Начать" button pressed in a dialog; payload carries the deep-link parameter
@@ -98,6 +131,40 @@ function extractInboundFacts(update) {
             chatId: String(chatId),
             isGroup: false,
             timestamp: update.timestamp,
+        };
+    }
+    // Inline keyboard button press: synthesize a regular inbound message from the
+    // callback payload (donor `processCallback` pattern). The button label is not
+    // echoed by MAX — agents receive the payload, so button payloads should be
+    // self-describing (plain strings become payload=text in the send path). The
+    // text of the message the button was attached to usually is echoed, so it is
+    // quoted after the payload to give the agent the context of the press.
+    if (type === "message_callback") {
+        const cb = update.callback;
+        if (!cb?.user?.user_id || !cb.callback_id)
+            return null;
+        const payload = typeof cb.payload === "string" ? cb.payload : "";
+        if (!payload.trim())
+            return null;
+        const user = cb.user;
+        const msgChatId = update.message?.recipient?.chat_id ?? update.message?.chat_id ?? update.chat_id;
+        const chatId = msgChatId ?? user.user_id;
+        const sourceText = typeof update.message?.body?.text === "string"
+            ? update.message.body.text.replace(/\s+/g, " ").trim()
+            : "";
+        const clipped = sourceText.length > 200 ? `${sourceText.slice(0, 199)}…` : sourceText;
+        const text = clipped ? `${payload}\n[Button on: "${clipped}"]` : payload;
+        return {
+            messageId: `callback:${cb.callback_id}`,
+            text,
+            senderId: String(user.user_id),
+            senderName: user.name || [user.first_name, user.last_name].filter(Boolean).join(" ") || "Unknown",
+            senderIsBot: Boolean(user.is_bot),
+            chatId: String(chatId),
+            replyTarget: msgChatId != null ? undefined : `max:user:${user.user_id}`,
+            isGroup: (update.message?.recipient?.chat_type ?? "dialog") !== "dialog",
+            timestamp: cb.timestamp,
+            callbackId: cb.callback_id,
         };
     }
     return null;
@@ -124,10 +191,14 @@ function attachmentNeedsAuth(url) {
 }
 async function downloadAttachment(url, token) {
     const headers = token && attachmentNeedsAuth(url) ? { Authorization: `Bearer ${token}` } : undefined;
-    const resp = await getMaxFetch()(url, headers ? { headers } : undefined);
-    if (!resp.ok)
-        throw new Error(`download failed: HTTP ${resp.status}`);
-    return Buffer.from(await resp.arrayBuffer());
+    // SSRF-guarded; the size limit is enforced before/while buffering.
+    const { buffer } = await downloadRemoteMedia({
+        url,
+        fetchImpl: getMaxFetch(),
+        headers,
+        maxBytes: MAX_ATTACHMENT_BYTES,
+    });
+    return buffer;
 }
 /**
  * Transcribe a saved audio file through the core media-understanding pipeline.
@@ -148,13 +219,108 @@ async function transcribeSavedAudio(api, filePath, mime) {
         return null;
     }
 }
+/**
+ * Inbound video attachments often carry only a token. Resolve a playback URL
+ * via getVideoInfo (best available mp4, hls as fallback); urls === null means
+ * the video is not ready/available — the message then keeps the plain marker.
+ */
+async function resolveVideoPlaybackUrl(api, token) {
+    const bot = getBot();
+    if (!bot)
+        return undefined;
+    try {
+        const info = await bot.api.getVideoInfo(token);
+        const urls = info?.urls;
+        if (!urls)
+            return undefined;
+        return (urls.mp4_1080 ??
+            urls.mp4_720 ??
+            urls.mp4_480 ??
+            urls.mp4_360 ??
+            urls.mp4_240 ??
+            urls.mp4_144 ??
+            urls.hls ??
+            undefined);
+    }
+    catch (err) {
+        api.logger.warn(`[MAX] getVideoInfo failed: ${err?.message ?? err}`);
+        return undefined;
+    }
+}
 /** Download attachments into the media store; voice is transcribed by the core media-understanding pipeline (`tools.media.audio`). */
 async function buildTextAndMedia(api, facts, token) {
     const rt = api.runtime?.channel;
     const media = [];
     let text = facts.text;
-    for (const att of facts.attachments ?? []) {
-        const url = att?.payload?.url ?? (Array.isArray(att?.payload?.ls) ? att.payload.ls[0] : undefined);
+    const attachments = facts.attachments ?? [];
+    if (attachments.length > MAX_INBOUND_ATTACHMENTS) {
+        api.logger.warn(`[MAX] message has ${attachments.length} attachments, only the first ${MAX_INBOUND_ATTACHMENTS} are processed`);
+    }
+    for (const att of attachments.slice(0, MAX_INBOUND_ATTACHMENTS)) {
+        // Stickers: no downloadable media — cache the code per chat (so the agent
+        // can resend it) and surface it to the agent as a text marker.
+        if (att?.type === "sticker") {
+            const code = typeof att?.payload?.code === "string" ? att.payload.code : "";
+            if (code)
+                rememberStickerCode(facts.chatId, code);
+            const emoji = typeof att?.payload?.emoji === "string" ? att.payload.emoji : "";
+            const marker = code
+                ? emoji
+                    ? `[Sticker ${emoji} (code ${code})]`
+                    : `[Sticker (code ${code})]`
+                : "[Sticker]";
+            text = text ? `${text}\n${marker}` : marker;
+            continue;
+        }
+        // Location: coordinates are top-level fields (ll=lon,lat on Yandex Maps).
+        if (att?.type === "location") {
+            const lat = att?.latitude ?? att?.payload?.latitude;
+            const lon = att?.longitude ?? att?.payload?.longitude;
+            if (lat != null && lon != null) {
+                const url = `https://yandex.ru/maps/?ll=${encodeURIComponent(`${lon},${lat}`)}&z=15`;
+                const marker = `[Location: ${lat}, ${lon}](${url})`;
+                text = text ? `${text}\n${marker}` : marker;
+            }
+            continue;
+        }
+        // Contact: display name from the VCard FN line, or the linked MAX profile.
+        if (att?.type === "contact") {
+            const raw = att?.payload?.vcf_info ?? "";
+            const fn = String(raw)
+                .split("\n")
+                .find((line) => line.startsWith("FN:"))
+                ?.slice(3);
+            const maxInfo = att?.payload?.max_info;
+            const maxName = maxInfo
+                ? [maxInfo.first_name, maxInfo.last_name].filter(Boolean).join(" ") ||
+                    (typeof maxInfo.name === "string" ? maxInfo.name : "")
+                : "";
+            const name = fn || maxName;
+            const marker = `[Contact${name ? `: ${name}` : ""}]`;
+            text = text ? `${text}\n${marker}` : marker;
+            continue;
+        }
+        // Share: forwarded post/contact cards carry a title and/or payload.url.
+        if (att?.type === "share") {
+            const title = typeof att?.title === "string" ? att.title : "";
+            const shareUrl = typeof att?.payload?.url === "string" ? att.payload.url : "";
+            const label = title && shareUrl ? `${title} (${shareUrl})` : title || shareUrl;
+            const marker = `[Shared${label ? `: ${label}` : ""}]`;
+            text = text ? `${text}\n${marker}` : marker;
+            continue;
+        }
+        // Anything else we cannot render: tell the agent something arrived instead
+        // of dropping it silently.
+        const knownMediaType = att?.type === "image" || att?.type === "video" || att?.type === "audio" || att?.type === "file";
+        if (att?.type && !knownMediaType) {
+            const marker = `[Unsupported attachment: ${att.type}]`;
+            text = text ? `${text}\n${marker}` : marker;
+            continue;
+        }
+        let url = att?.payload?.url ?? (Array.isArray(att?.payload?.ls) ? att.payload.ls[0] : undefined);
+        if (!url && att?.type === "video" && att?.payload?.token) {
+            url = await resolveVideoPlaybackUrl(api, att.payload.token);
+        }
         if (!url)
             continue;
         if (att.type === "audio") {
@@ -271,7 +437,7 @@ async function runInbound(api, facts, token) {
                         routeSessionKey: sessionKey,
                         mainSessionKey: route.mainSessionKey,
                     },
-                    reply: { to: `max:${chatId}` },
+                    reply: { to: facts.replyTarget ?? `max:${chatId}` },
                     message: {
                         inboundEventKind: "user_request",
                         rawBody: text,
@@ -284,10 +450,19 @@ async function runInbound(api, facts, token) {
                 });
                 const sendTyping = async () => {
                     const bot = getBot();
-                    if (bot) {
+                    // sendAction needs a real chat id — no chat exists on the user-target path
+                    if (bot && replyUserId == null) {
                         await bot.api.sendAction(Number(chatId), "typing_on");
                     }
                 };
+                // message_callback without a source message: there is no chat to reply
+                // into (the bare user id as chat_id 404s), so answer the user directly.
+                const replyUserId = facts.replyTarget != null
+                    ? Number(facts.replyTarget.replace(/^max:user:/i, ""))
+                    : null;
+                const sendReplyMessage = (bot, text, extra) => replyUserId != null
+                    ? bot.api.sendMessageToUser(replyUserId, text, extra)
+                    : bot.api.sendMessageToChat(Number(chatId), text, extra);
                 // --- Draft streaming: cumulative partial replies edit one draft message ---
                 const streamingEnabled = cfg.channels?.[MAX_CHANNEL_ID]?.streaming !== false;
                 const STREAM_EDIT_INTERVAL_MS = 800;
@@ -301,18 +476,22 @@ async function runInbound(api, facts, token) {
                     const mid = sent?.message?.body?.mid ?? sent?.body?.mid ?? sent?.id;
                     return mid != null ? String(mid) : null;
                 };
-                const editDraft = (text, final) => {
+                const editDraft = (text, final, attachments) => {
                     draft.chain = draft.chain.then(async () => {
                         const bot = getBot();
                         if (!bot || !draft.mid)
                             return;
                         try {
-                            await bot.api.editMessage(draft.mid, { text, format: "markdown" });
+                            await bot.api.editMessage(draft.mid, {
+                                text,
+                                format: "markdown",
+                                ...(attachments ? { attachments } : {}),
+                            });
                         }
                         catch {
                             // invalid markdown must not lose the reply
                             try {
-                                await bot.api.editMessage(draft.mid, { text });
+                                await bot.api.editMessage(draft.mid, { text, ...(attachments ? { attachments } : {}) });
                             }
                             catch {
                                 // best-effort preview
@@ -321,7 +500,8 @@ async function runInbound(api, facts, token) {
                         draft.lastEditAt = Date.now();
                         if (!final) {
                             // MAX clears the typing indicator on edit — renew it
-                            bot.api.sendAction(Number(chatId), "typing_on").catch(() => { });
+                            if (replyUserId == null)
+                                bot.api.sendAction(Number(chatId), "typing_on").catch(() => { });
                         }
                     });
                     return draft.chain;
@@ -339,7 +519,8 @@ async function runInbound(api, facts, token) {
                     const preview = text.slice(0, MAX_TEXT_LIMIT - 2) + " …";
                     if (!draft.mid) {
                         try {
-                            draft.mid = extractMid(await bot.api.sendMessageToChat(Number(chatId), preview, { format: "markdown" }));
+                            draft.mid = extractMid(await sendReplyMessage(bot, preview, { format: "markdown" }));
+                            noteOwnDraftMid(draft.mid);
                         }
                         catch {
                             draft.mid = null;
@@ -364,7 +545,7 @@ async function runInbound(api, facts, token) {
                         updateLastRoute: {
                             sessionKey,
                             channel: MAX_CHANNEL_ID,
-                            to: `max:${chatId}`,
+                            to: facts.replyTarget ?? `max:${chatId}`,
                             accountId: route.accountId,
                         },
                         onRecordError: (err) => api.logger.warn(`[MAX] session record failed: ${err?.message ?? err}`),
@@ -386,20 +567,38 @@ async function runInbound(api, facts, token) {
                                 const out = typeof payload?.text === "string" ? payload.text : "";
                                 if (!bot)
                                     return undefined;
+                                // Inline keyboard travels on the payload as opaque
+                                // channelData (the core forwards it untouched); it is
+                                // attached only to the final authoritative message — never
+                                // to streaming draft edits.
+                                let keyboardButtons = null;
+                                try {
+                                    keyboardButtons = resolveReplyKeyboardButtons(payload?.channelData);
+                                }
+                                catch (err) {
+                                    api.logger.warn(`[MAX] invalid maxInlineKeyboard, sending without keyboard: ${err?.message ?? err}`);
+                                }
+                                const keyboardAttachment = keyboardButtons
+                                    ? toInlineKeyboardAttachment(keyboardButtons)
+                                    : undefined;
+                                // Per-message send options: channelData.maxNotify /
+                                // maxDisableLinkPreview override the channel config defaults.
+                                const sendOpts = resolveMaxSendOptions(cfg, payload?.channelData);
                                 if (draft.mid) {
                                     // The draft exists: edit it into the authoritative final text
                                     // (no cursor), then send any overflow chunks as new messages.
+                                    // The keyboard rides on the final edit of the draft message.
                                     const finalText = out.trim() ? out : draft.accumulated;
                                     const chunks = chunkText(finalText, MAX_TEXT_LIMIT);
-                                    await editDraft(chunks[0] ?? "", true);
+                                    await editDraft(chunks[0] ?? "", true, keyboardAttachment ? [keyboardAttachment] : undefined);
                                     const messageIds = [draft.mid];
                                     for (const chunk of chunks.slice(1)) {
                                         let sent;
                                         try {
-                                            sent = await bot.api.sendMessageToChat(Number(chatId), chunk, { format: "markdown" });
+                                            sent = await sendReplyMessage(bot, chunk, { format: "markdown", ...sendOpts });
                                         }
                                         catch {
-                                            sent = await bot.api.sendMessageToChat(Number(chatId), chunk);
+                                            sent = await sendReplyMessage(bot, chunk, { ...sendOpts });
                                         }
                                         const mid = extractMid(sent);
                                         if (mid)
@@ -409,15 +608,26 @@ async function runInbound(api, facts, token) {
                                 }
                                 if (!out.trim())
                                     return undefined;
+                                const chunks = chunkText(out, MAX_TEXT_LIMIT);
                                 const messageIds = [];
-                                for (const chunk of chunkText(out, MAX_TEXT_LIMIT)) {
+                                for (let i = 0; i < chunks.length; i++) {
+                                    const chunk = chunks[i];
+                                    // Keyboard goes on the last chunk — the final message.
+                                    const attachments = i === chunks.length - 1 && keyboardAttachment ? [keyboardAttachment] : undefined;
                                     let sent;
                                     try {
-                                        sent = await bot.api.sendMessageToChat(Number(chatId), chunk, { format: "markdown" });
+                                        sent = await sendReplyMessage(bot, chunk, {
+                                            format: "markdown",
+                                            ...sendOpts,
+                                            ...(attachments ? { attachments } : {}),
+                                        });
                                     }
                                     catch {
                                         // invalid markdown must not lose the reply
-                                        sent = await bot.api.sendMessageToChat(Number(chatId), chunk);
+                                        sent = await sendReplyMessage(bot, chunk, {
+                                            ...sendOpts,
+                                            ...(attachments ? { attachments } : {}),
+                                        });
                                     }
                                     const mid = extractMid(sent);
                                     if (mid)
@@ -436,8 +646,163 @@ async function runInbound(api, facts, token) {
         },
     });
 }
+/**
+ * DM access gate — runs BEFORE any attachment download or disk write, so a
+ * blocked sender cannot make the plugin fetch or store anything. Group chats
+ * are not gated here (group policy is a separate surface). Config policies map
+ * onto the SDK vocabulary: "closed" → "disabled"; unset → "allowlist"
+ * (matches the security.dm defaultPolicy the plugin reports to core).
+ */
+async function checkDmAccess(api, facts) {
+    if (facts.isGroup)
+        return true;
+    const rt = api.runtime;
+    const cfg = rt?.config?.current?.() ?? api.config ?? {};
+    const section = cfg?.channels?.[MAX_CHANNEL_ID] ?? {};
+    const rawPolicy = section.dmPolicy ?? "allowlist";
+    const dmPolicy = rawPolicy === "closed" ? "disabled" : rawPolicy;
+    if (dmPolicy === "open")
+        return true;
+    let storeAllowFrom = [];
+    try {
+        storeAllowFrom =
+            (await rt?.channel?.pairing?.readAllowFromStore?.({
+                channel: MAX_CHANNEL_ID,
+                accountId: DEFAULT_ACCOUNT_ID,
+            })) ?? [];
+    }
+    catch (err) {
+        api.logger.warn(`[MAX] pairing allowlist read failed: ${err?.message ?? err}`);
+    }
+    const { decision, reason } = resolveDmGroupAccessWithLists({
+        isGroup: false,
+        dmPolicy,
+        allowFrom: section.allowFrom ?? [],
+        storeAllowFrom,
+        isSenderAllowed: (allowFrom) => allowFrom.some((entry) => normalizeMaxTarget(String(entry)).replace(/^user:/i, "") === String(facts.senderId)),
+    });
+    if (decision === "allow")
+        return true;
+    api.logger.info(`[MAX] inbound dropped by dmPolicy=${rawPolicy}: ${reason} (sender=${facts.senderId})`);
+    if (decision === "pairing") {
+        try {
+            const pairing = createChannelPairingController({
+                core: rt,
+                channel: MAX_CHANNEL_ID,
+                accountId: DEFAULT_ACCOUNT_ID,
+            });
+            const bot = getBot();
+            await pairing.issueChallenge({
+                senderId: String(facts.senderId),
+                senderIdLine: `maxUserId: ${facts.senderId}`,
+                sendPairingReply: async (text) => {
+                    if (bot) {
+                        await bot.api.sendMessageToUser(Number(facts.senderId), text, { format: "markdown" });
+                    }
+                },
+            });
+        }
+        catch (err) {
+            api.logger.warn(`[MAX] pairing challenge failed: ${err?.message ?? err}`);
+        }
+    }
+    return false;
+}
+function escapeRegExp(s) {
+    return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+/**
+ * Cached bot identity (user id + username) for group mention detection.
+ * Fetched lazily via getBot() on first use — through the exported getter so
+ * tests and re-initialization both see the current bot.
+ */
+let botIdentity = null;
+let botIdentityPromise = null;
+async function ensureBotIdentity() {
+    if (botIdentity)
+        return botIdentity;
+    botIdentityPromise ??= (async () => {
+        try {
+            const me = await getBot()?.api.getMyInfo();
+            botIdentity = { userId: me?.user_id, username: me?.username };
+        }
+        catch {
+            botIdentity = {};
+        }
+        return botIdentity;
+    })();
+    return botIdentityPromise;
+}
+/**
+ * Group access gate — runs BEFORE any attachment download or disk write (same
+ * principle as the DM gate). Defaults preserve the pre-0.5 behavior: without
+ * config, groups are open and no mention is required.
+ *
+ * - groupPolicy "disabled" → all group traffic is ignored;
+ * - "allowlist" → the chat must appear in `groups` (or via the "*" wildcard)
+ *   and, when groupAllowFrom is non-empty, the sender must be listed;
+ * - per-group `enabled: false` switches a single group off;
+ * - requireMention (per-group → "*" → top-level, default false): the bot
+ *   answers only when @-mentioned by username or replied to. Button presses
+ *   (message_callback) are interactions with the bot's own message and always
+ *   count as a mention.
+ */
+async function checkGroupAccess(api, facts) {
+    if (!facts.isGroup)
+        return true;
+    const rt = api.runtime;
+    const cfg = rt?.config?.current?.() ?? api.config ?? {};
+    const section = cfg?.channels?.[MAX_CHANNEL_ID] ?? {};
+    const drop = (reason) => {
+        api.logger.info(`[MAX] group message dropped: ${reason} (chat=${facts.chatId})`);
+        return false;
+    };
+    const groupPolicy = section.groupPolicy ?? "open";
+    if (groupPolicy === "disabled")
+        return drop("groupPolicy=disabled");
+    const groups = section.groups ?? {};
+    const groupCfg = groups[facts.chatId] ?? groups["*"];
+    if (groupPolicy === "allowlist") {
+        if (!(facts.chatId in groups) && !("*" in groups)) {
+            return drop("chat not in groups allowlist");
+        }
+        const groupAllowFrom = section.groupAllowFrom ?? [];
+        if (groupAllowFrom.length > 0) {
+            const allowed = groupAllowFrom.some((entry) => normalizeMaxTarget(String(entry)).replace(/^user:/i, "") === String(facts.senderId));
+            if (!allowed)
+                return drop("sender not in groupAllowFrom");
+        }
+    }
+    if (groupCfg?.enabled === false)
+        return drop("group disabled via groups config");
+    const requireMention = typeof groupCfg?.requireMention === "boolean"
+        ? groupCfg.requireMention
+        : typeof section.requireMention === "boolean"
+            ? section.requireMention
+            : false;
+    if (!requireMention)
+        return true;
+    // Button presses on the bot's own keyboard are implicit mentions.
+    if (facts.callbackId)
+        return true;
+    // Reply to one of the bot's messages counts as a mention (Telegram-style).
+    if (facts.replyToSenderIsBot)
+        return true;
+    const identity = await ensureBotIdentity();
+    if (facts.replyToSenderId &&
+        identity.userId != null &&
+        facts.replyToSenderId === String(identity.userId)) {
+        return true;
+    }
+    if (identity.username) {
+        const mentionRe = new RegExp(`@${escapeRegExp(identity.username)}\\b`, "i");
+        if (mentionRe.test(facts.text))
+            return true;
+    }
+    return drop("bot not mentioned (requireMention)");
+}
 /** Shared update handler for webhook and polling transports. */
-async function handleUpdate(api, update, token) {
+export async function handleUpdate(api, update, token) {
     const facts = extractInboundFacts(update);
     if (!facts)
         return;
@@ -448,6 +813,26 @@ async function handleUpdate(api, update, token) {
         api.logger.info(`[MAX] duplicate message ${facts.messageId} ignored`);
         return;
     }
+    // Inline keyboard callbacks: MAX shows a spinner on the button until the
+    // bot answers; acknowledge immediately (empty answer — no notification).
+    // The synthesized inbound still runs the full agent turn.
+    if (facts.callbackId) {
+        const bot = getBot();
+        if (bot) {
+            try {
+                await bot.api.answerOnCallback(facts.callbackId, { message: null });
+            }
+            catch (err) {
+                api.logger.warn(`[MAX] answerOnCallback failed: ${err?.message ?? err}`);
+            }
+        }
+    }
+    // Access gate BEFORE any download, session record or last-route write: a
+    // blocked sender causes zero fetches and zero disk writes.
+    if (!(await checkDmAccess(api, facts)))
+        return;
+    if (!(await checkGroupAccess(api, facts)))
+        return;
     await runInbound(api, facts, token);
 }
 export default defineChannelPluginEntry({
@@ -476,9 +861,16 @@ export default defineChannelPluginEntry({
             api.logger.warn("[MAX] No token found, bot not initialized");
             return;
         }
+        const groupWarning = resolveGroupPolicyWarning(section);
+        if (groupWarning)
+            api.logger.warn(`[MAX] ${groupWarning}`);
         // The channel gateway lifecycle (gateway.startAccount) owns bot startup;
         // here we expose the inbound handler and the webhook HTTP route.
         setMaxUpdateHandler((update, handlerToken) => handleUpdate(api, update, handlerToken));
+        // Agent tool: send a file into the current MAX chat. Registered as a
+        // factory so the per-run tool context (delivery route, agent, workspace)
+        // is captured fresh for each session.
+        api.registerTool((toolCtx) => createMaxSendFileTool(toolCtx));
         // --- Webhook handler ---
         api.registerHttpRoute({
             path: "/max/webhook",

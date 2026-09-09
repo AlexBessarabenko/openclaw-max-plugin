@@ -1,9 +1,15 @@
 import { createChatChannelPlugin } from "openclaw/plugin-sdk/channel-core";
-import { createAccountStatusSink, waitUntilAbort } from "openclaw/plugin-sdk/channel-lifecycle";
+import { createAccountStatusSink, waitUntilAbort } from "openclaw/plugin-sdk/channel-outbound";
 import { buildProbeChannelStatusSummary } from "openclaw/plugin-sdk/channel-status";
 import { createComputedAccountStatusAdapter, createDefaultChannelRuntimeState } from "openclaw/plugin-sdk/status-helpers";
 import { Bot } from "@maxhub/max-bot-api";
 import { createMaxScopedFetch } from "./certs.js";
+import { getAgentScopedMediaLocalRoots } from "openclaw/plugin-sdk/media-runtime";
+import { downloadRemoteMedia, readLocalMedia } from "./src/media-access.js";
+import { isPrivateOrLoopbackHost } from "openclaw/plugin-sdk/ssrf-runtime";
+import { primeSeenMessageIds, recentSeenMessageIds } from "./src/dedup.js";
+import { loadMaxPollingState, saveMaxPollingState } from "./src/polling-state.js";
+import { maxMessageActions } from "./src/actions.js";
 export const MAX_CHANNEL_ID = "max";
 export const DEFAULT_ACCOUNT_ID = "default";
 /** MAX Bot API v2 base URL (platform-api.max.ru is deprecated since 2026-07-19). */
@@ -11,7 +17,7 @@ export const DEFAULT_API_BASE_URL = "https://platform-api2.max.ru";
 function resolveAccountId(params) {
     return params.accountId ?? DEFAULT_ACCOUNT_ID;
 }
-function resolveAccount(cfg, accountId) {
+export function resolveAccount(cfg, accountId) {
     const section = cfg.channels?.[MAX_CHANNEL_ID];
     const token = section?.token ?? "";
     return {
@@ -60,11 +66,54 @@ function resolveSendTarget(to) {
         return { userId: Number(t.slice(5)) };
     return { chatId: Number(t) };
 }
-async function sendMaxMessage(bot, to, text, extra) {
+/**
+ * MAX processes fresh uploads asynchronously; sending right after an upload
+ * can fail with `attachment.not.ready`. Retry the SEND (never the upload)
+ * with a growing pause, only for that error, only when attachments ride along
+ * (6 attempts total: 1.5s → 4s between them).
+ */
+const ATTACHMENT_NOT_READY_RE = /attachment\.not\.ready/;
+const ATTACHMENT_RETRY_DELAYS_MS = [1500, 2000, 2500, 3000, 4000];
+export async function sendMaxMessage(bot, to, text, extra) {
     const target = resolveSendTarget(to);
-    return "userId" in target
-        ? bot.api.sendMessageToUser(target.userId, text, extra)
-        : bot.api.sendMessageToChat(target.chatId, text, extra);
+    const hasAttachments = Array.isArray(extra?.attachments) && extra.attachments.length > 0;
+    const maxAttempts = hasAttachments ? 1 + ATTACHMENT_RETRY_DELAYS_MS.length : 1;
+    for (let attempt = 1;; attempt++) {
+        try {
+            return "userId" in target
+                ? await bot.api.sendMessageToUser(target.userId, text, extra)
+                : await bot.api.sendMessageToChat(target.chatId, text, extra);
+        }
+        catch (err) {
+            const reason = String(err?.code ?? err?.message ?? err);
+            if (!hasAttachments || attempt >= maxAttempts || !ATTACHMENT_NOT_READY_RE.test(reason)) {
+                throw err;
+            }
+            await new Promise((resolve) => setTimeout(resolve, ATTACHMENT_RETRY_DELAYS_MS[attempt - 1]));
+        }
+    }
+}
+/**
+ * Raw-structure send for attachment-only messages (stickers, contacts,
+ * locations). Unlike `sendMaxMessage`, the text field is omitted entirely
+ * when empty — MAX rejects sticker-only sends that carry an empty `text`.
+ * These attachment kinds reference existing server-side objects (no fresh
+ * upload), so the attachment.not.ready retry of `sendMaxMessage` is not
+ * needed here.
+ */
+export async function sendMaxBody(bot, to, body) {
+    const target = resolveSendTarget(to);
+    const payload = {
+        ...(body.text ? { text: body.text } : {}),
+        ...(body.attachments ? { attachments: body.attachments } : {}),
+        ...(body.link ? { link: body.link } : {}),
+        ...(body.format ? { format: body.format } : {}),
+        ...(body.notify !== undefined ? { notify: body.notify } : {}),
+    };
+    const res = "userId" in target
+        ? await bot.api.raw.messages.send({ user_id: target.userId, ...payload })
+        : await bot.api.raw.messages.send({ chat_id: target.chatId, ...payload });
+    return extractSentMessageId(res);
 }
 /**
  * Target adapter for the `message` tool and `openclaw message send --channel max`.
@@ -116,7 +165,7 @@ export const maxMessaging = {
 const IMAGE_EXTS = new Set(["png", "jpg", "jpeg", "gif", "webp"]);
 const VIDEO_EXTS = new Set(["mp4", "mov", "avi", "webm", "mkv"]);
 const AUDIO_EXTS = new Set(["mp3", "ogg", "wav", "m4a", "opus"]);
-function resolveMaxUploadType(filename, contentType) {
+export function resolveMaxUploadType(filename, contentType) {
     const ext = filename?.split(".").pop()?.toLowerCase() ?? "";
     if (contentType?.startsWith("image/") || IMAGE_EXTS.has(ext))
         return "image";
@@ -133,7 +182,7 @@ function resolveMaxUploadType(filename, contentType) {
  * getUploadUrl response (range-upload flow: video/audio/file) or in the upload
  * response JSON ("photos" map for image uploads, "token" otherwise).
  */
-async function rawUploadMaxMedia(bot, type, data, filename) {
+export async function rawUploadMaxMedia(bot, type, data, filename) {
     const { url, token } = await bot.api.raw.uploads.getUploadUrl({ type });
     const form = new FormData();
     form.append("data", new Blob([data]), filename);
@@ -154,13 +203,114 @@ function extractSentMessageId(sent) {
     const mid = sent?.message?.body?.mid ?? sent?.body?.mid ?? sent?.id;
     return mid != null ? String(mid) : String(Date.now());
 }
+/**
+ * Send one media message. Remote image URLs ride by URL (attachment
+ * payload.url) — MAX fetches the link server-side, no upload round trip;
+ * the host is screened the same way the download path is (private/loopback
+ * hosts are refused). Everything else (non-image URLs, local files) goes
+ * through the SSRF-guarded download + upload flow.
+ */
+export async function sendMaxMedia(bot, params) {
+    const mediaUrl = params.mediaUrl;
+    let attachment;
+    if (/^https?:\/\//i.test(mediaUrl)) {
+        const filename = decodeURIComponent(new URL(mediaUrl).pathname.split("/").pop() ?? "") || "file";
+        if (resolveMaxUploadType(filename) === "image") {
+            const host = new URL(mediaUrl).hostname;
+            if (isPrivateOrLoopbackHost(host)) {
+                throw new Error(`refusing to send image by URL: private or loopback host "${host}"`);
+            }
+            attachment = { type: "image", payload: { url: mediaUrl } };
+        }
+        else {
+            // SSRF-guarded download; scoped MAX fetch (CA/proxy) stays in effect
+            const fetched = await downloadRemoteMedia({ url: mediaUrl, fetchImpl: getMaxFetch() });
+            attachment = await rawUploadMaxMedia(bot, resolveMaxUploadType(filename, fetched.contentType || undefined), fetched.buffer, filename);
+        }
+    }
+    else {
+        // Local paths only via the host reader or inside the allowed media
+        // roots — otherwise an agent-named path could exfiltrate any file.
+        const data = await readLocalMedia(mediaUrl, {
+            mediaReadFile: params.mediaReadFile,
+            mediaLocalRoots: params.mediaLocalRoots,
+        });
+        const filename = mediaUrl.split("/").pop() || "file";
+        attachment = await rawUploadMaxMedia(bot, resolveMaxUploadType(filename), data, filename);
+    }
+    const sent = await sendMaxMessage(bot, params.to, params.text ?? "", {
+        ...(params.extra ?? {}),
+        attachments: [attachment],
+    });
+    return extractSentMessageId(sent);
+}
 // Store bot instance for outbound messaging
 let botInstance = null;
+/**
+ * Startup warning for the permissive group posture: with groupPolicy=open and
+ * no groupAllowFrom the bot answers everyone in every group it is added to.
+ */
+export function resolveGroupPolicyWarning(section) {
+    const groupPolicy = section?.groupPolicy ?? "open";
+    const groupAllowFrom = Array.isArray(section?.groupAllowFrom) ? section.groupAllowFrom : [];
+    if (groupPolicy === "open" && groupAllowFrom.length === 0) {
+        return ("channels.max.groupPolicy is \"open\" and groupAllowFrom is empty: " +
+            "the bot will answer every member of every group it joins. " +
+            "Set groupPolicy/allowlist or groupAllowFrom to restrict this.");
+    }
+    return null;
+}
 /** Scoped fetch of the currently initialized account (proxy-aware). */
 let maxFetch = createMaxScopedFetch();
 /** Scoped fetch for direct calls outside bot init (probes, attachment downloads). */
 export function getMaxFetch() {
     return maxFetch;
+}
+/**
+ * Pairing approval notice, sent after `openclaw pairing approve` (with
+ * --notify). The pairing id is a MAX user id — the reply goes through
+ * sendMessageToUser (the bare user id is not a chat id).
+ */
+export async function sendMaxPairingApproval(bot, id) {
+    const userId = Number(String(id).trim().replace(/^user:/i, ""));
+    if (!Number.isFinite(userId)) {
+        throw new Error(`pairing id "${id}" is not a MAX user id`);
+    }
+    await bot.api.sendMessageToUser(userId, "✅ Доступ одобрен. Можете продолжать диалог с ботом.", { format: "markdown" });
+}
+/** Masked token preview for diagnostics: first/last 4 chars, never the secret. */
+export function maskMaxToken(token) {
+    if (!token)
+        return null;
+    if (token.length <= 8)
+        return "****";
+    return `${token.slice(0, 4)}…${token.slice(-4)}`;
+}
+/**
+ * Per-message send options: `channelData.maxNotify` / `maxDisableLinkPreview`
+ * override the channel config defaults (`channels.max.notify` /
+ * `disableLinkPreview`). Unset fields are omitted — the MAX server default
+ * (notify on, link preview on) applies.
+ */
+export function resolveMaxSendOptions(cfg, channelData) {
+    const section = cfg.channels?.[MAX_CHANNEL_ID] ?? {};
+    const cd = channelData && typeof channelData === "object" && !Array.isArray(channelData)
+        ? channelData
+        : {};
+    const notify = typeof cd.maxNotify === "boolean"
+        ? cd.maxNotify
+        : typeof section.notify === "boolean"
+            ? section.notify
+            : undefined;
+    const disableLinkPreview = typeof cd.maxDisableLinkPreview === "boolean"
+        ? cd.maxDisableLinkPreview
+        : typeof section.disableLinkPreview === "boolean"
+            ? section.disableLinkPreview
+            : undefined;
+    return {
+        ...(notify !== undefined ? { notify } : {}),
+        ...(disableLinkPreview !== undefined ? { disable_link_preview: disableLinkPreview } : {}),
+    };
 }
 let updateHandler = null;
 export function setMaxUpdateHandler(handler) {
@@ -229,6 +379,33 @@ export const maxPlugin = createChatChannelPlugin({
                 "Delivery target: dialog chat id (positive) or `user:<user_id>` for DMs;",
                 "group/channel ids are negative.",
                 "Attach media via the message tool `media` param (local path or URL).",
+                "Groups: the bot may answer only when @-mentioned or replied to (requireMention config).",
+                "Inline keyboards: pass `channelData.maxInlineKeyboard` on the message tool —",
+                "an array of rows, each row an array of buttons `{text, url?, payload?}`",
+                "(url → link button, otherwise callback; payload defaults to the label) or",
+                "plain strings (callback with payload = text). Full wire buttons",
+                "`{type: \"callback\"|\"link\"|\"clipboard\", ...}` are accepted too.",
+                "Limits: ≤210 buttons, ≤30 rows, ≤7 per row (≤3 if a row has a link),",
+                "link URL ≤2048 chars. The keyboard attaches to the final reply only,",
+                "on the reply path (not via `openclaw message send`); a button press",
+                "returns as an inbound message carrying the payload (plus a quote of",
+                "the message the button was on) — make payloads self-describing.",
+                "",
+                "### MAX message actions",
+                'Sticker: message(action="sticker", target="<chat_id>", stickerId="<code>") — codes come',
+                "from received stickers ([Sticker (code …)] markers); omit stickerId to echo the",
+                "last sticker seen in that chat.",
+                'Location pin: message(action="sendAttachment", type="location", target="<chat_id>", latitude="55.75", longitude="37.62").',
+                'Contact card: message(action="sendAttachment", type="contact", target="<chat_id>", contactName="Name", vcfPhone="+79001234567") — or contactId=<MAX user_id>.',
+                'Edit your own message: message(action="edit", messageId="<mid>", message="new text") —',
+                "up to 7 days in dialogs; no time limit with an inline keyboard or in",
+                "groups/channels (≤2 edits/sec per chat).",
+                'Delete your own message: message(action="delete", messageId="<mid>") — no time limit.',
+                'Pin/unpin: message(action="pin", target="<chat_id>", messageId="<mid>", notify=false) /',
+                'message(action="unpin", target="<chat_id>").',
+                "Per-message options on replies: channelData.maxNotify=false (silent),",
+                "channelData.maxDisableLinkPreview=true; channel defaults: channels.max.notify /",
+                "disableLinkPreview. Image URLs are attached by link (no re-upload).",
             ],
             inboundFormattingHints: () => ({
                 text_markup: "markdown",
@@ -244,10 +421,30 @@ export const maxPlugin = createChatChannelPlugin({
                 return params.cfg;
             },
         },
+        // Message-tool actions owned by the channel (edit/delete/pin/unpin/
+        // sticker/sendAttachment); plain send stays on the core outbound path.
+        actions: maxMessageActions,
         config: {
             resolveAccount,
             listAccountIds(cfg) {
                 return [DEFAULT_ACCOUNT_ID];
+            },
+            // Diagnostics for `openclaw status` — never leaks the token itself.
+            inspectAccount: (cfg, accountId) => {
+                const section = cfg.channels?.[MAX_CHANNEL_ID] ?? {};
+                const account = resolveAccount(cfg, accountId);
+                return {
+                    accountId: account.accountId ?? DEFAULT_ACCOUNT_ID,
+                    enabled: account.enabled,
+                    configured: account.configured,
+                    tokenSource: account.token ? "config" : "none",
+                    tokenPreview: maskMaxToken(account.token),
+                    dmPolicy: account.dmPolicy ?? "allowlist",
+                    groupPolicy: section.groupPolicy ?? "open",
+                    webhook: account.webhookUrl ? "webhook" : "polling",
+                    streaming: section.streaming !== false,
+                    httpProxy: Boolean(account.httpProxy),
+                };
             },
         },
         status: createComputedAccountStatusAdapter({
@@ -278,16 +475,15 @@ export const maxPlugin = createChatChannelPlugin({
             defaultPolicy: "allowlist",
         },
     },
-    // Pairing: approval flow for new DM contacts
+    // Pairing: approval flow for new DM contacts. The challenge code itself is
+    // sent by the inbound gate (index.ts issueChallenge → sendPairingReply);
+    // notifyApproval fires after `openclaw pairing approve --notify`.
     pairing: {
-        text: {
-            idLabel: "MAX user ID",
-            message: "Send this code to verify your identity:",
-            notify: async (params) => {
-                if (botInstance) {
-                    await botInstance.api.sendMessageToUser(Number(normalizeMaxTarget(params.id).replace(/^user:/i, "")), params.message, { format: "markdown" });
-                }
-            },
+        idLabel: "MAX user ID",
+        notifyApproval: async (params) => {
+            if (!botInstance)
+                return;
+            await sendMaxPairingApproval(botInstance, params.id);
         },
     },
     // Threading: how replies are delivered
@@ -301,7 +497,11 @@ export const maxPlugin = createChatChannelPlugin({
             channel: MAX_CHANNEL_ID,
             sendText: async (params) => {
                 const bot = ensureBotForOutbound(params.cfg);
-                const sent = await sendMaxMessage(bot, params.to, params.text, { format: "markdown" });
+                const opts = resolveMaxSendOptions(params.cfg);
+                // The core's `silent` flag maps to MAX notify=false.
+                if (params.silent === true)
+                    opts.notify = false;
+                const sent = await sendMaxMessage(bot, params.to, params.text, { format: "markdown", ...opts });
                 return { messageId: extractSentMessageId(sent) };
             },
             sendMedia: async (params) => {
@@ -310,31 +510,18 @@ export const maxPlugin = createChatChannelPlugin({
                 if (!mediaUrl) {
                     throw new Error("mediaUrl is required");
                 }
-                let data;
-                let filename;
-                let contentType;
-                if (/^https?:\/\//i.test(mediaUrl)) {
-                    const res = await fetch(mediaUrl);
-                    if (!res.ok)
-                        throw new Error(`failed to fetch media: HTTP ${res.status}`);
-                    data = Buffer.from(await res.arrayBuffer());
-                    filename =
-                        decodeURIComponent(new URL(mediaUrl).pathname.split("/").pop() ?? "") || "file";
-                    contentType = res.headers.get("content-type") ?? undefined;
-                }
-                else {
-                    if (!params.mediaReadFile) {
-                        throw new Error("local media is not readable in this context");
-                    }
-                    data = Buffer.from(await params.mediaReadFile(mediaUrl));
-                    filename = mediaUrl.split("/").pop() || "file";
-                }
-                const uploadType = resolveMaxUploadType(filename, contentType);
-                const attachment = await rawUploadMaxMedia(bot, uploadType, data, filename);
-                const sent = await sendMaxMessage(bot, params.to, params.text ?? "", {
-                    attachments: [attachment],
+                const opts = resolveMaxSendOptions(params.cfg);
+                if (params.silent === true)
+                    opts.notify = false;
+                const messageId = await sendMaxMedia(bot, {
+                    to: params.to,
+                    text: params.text,
+                    mediaUrl,
+                    mediaReadFile: params.mediaReadFile,
+                    mediaLocalRoots: params.mediaLocalRoots ?? getAgentScopedMediaLocalRoots(params.cfg),
+                    extra: opts,
                 });
-                return { messageId: extractSentMessageId(sent) };
+                return { messageId };
             },
         },
     },
@@ -371,13 +558,99 @@ export function getBot() {
  * `initializeBot` was never called. Fall back to a send-only client built
  * from the configured token; `Bot` only starts polling on `.startPolling()`.
  */
-function ensureBotForOutbound(cfg) {
+export function ensureBotForOutbound(cfg) {
     if (botInstance)
         return botInstance;
     const account = resolveAccount(cfg, DEFAULT_ACCOUNT_ID);
     if (!account.token)
         throw new Error("MAX token is not configured");
     return initializeBot(account.token, account.apiBaseUrl, account.httpProxy);
+}
+/** Update types the polling loop asks for (webhook subscription mirrors this). */
+const POLL_ALLOWED_UPDATES = ["message_created", "message_callback", "bot_started", "message_edited"];
+/** Transient polling errors, mirroring the SDK's Polling.shouldRetry. */
+function isTransientPollingError(err) {
+    if (!err || typeof err !== "object")
+        return false;
+    if (typeof err.status === "number")
+        return err.status === 429 || err.status >= 500;
+    return err.name === "TypeError";
+}
+/**
+ * Long-polling loop with a persistent marker (at-least-once delivery).
+ *
+ * The SDK's own Polling advances its marker in memory before processing; a
+ * gateway restart then loses or replays updates inside the server retention
+ * window. Here the marker (plus the tail of the dedup list) is persisted only
+ * AFTER the whole batch has been handed to the inbound handler. A crash
+ * mid-batch replays at most one batch; the persisted dedup ids make the
+ * replay a no-op. If any update in the batch failed, the in-memory marker
+ * still advances (no poison-message loop) but nothing is persisted, so the
+ * failed batch is retried after a restart.
+ */
+export async function runPollingLoop(params) {
+    const { bot, accountId, token, handler, signal, log } = params;
+    let marker;
+    try {
+        const state = await loadMaxPollingState(accountId);
+        if (typeof state.marker === "number")
+            marker = state.marker;
+        if (state.seenMessageIds?.length)
+            primeSeenMessageIds(state.seenMessageIds);
+        if (marker != null)
+            log?.info?.(`[MAX] polling resumes from persisted marker ${marker}`);
+    }
+    catch (err) {
+        log?.warn?.(`[MAX] polling state load failed, starting fresh: ${err?.message ?? err}`);
+    }
+    const BASE_DELAY_MS = 5000;
+    const MAX_DELAY_MS = 60000;
+    let delayMs = BASE_DELAY_MS;
+    while (!signal?.aborted) {
+        let batchFailed = false;
+        try {
+            const { updates, marker: next } = await bot.api.getUpdates(POLL_ALLOWED_UPDATES, {
+                marker,
+                limit: 100,
+                timeout: 30,
+                signal,
+            });
+            delayMs = BASE_DELAY_MS;
+            for (const update of updates ?? []) {
+                try {
+                    await handler(update, token);
+                }
+                catch (err) {
+                    batchFailed = true;
+                    log?.error?.(`[MAX] polling update failed: ${err?.message ?? err}`);
+                }
+            }
+            if (typeof next === "number") {
+                marker = next;
+                if (!batchFailed) {
+                    try {
+                        await saveMaxPollingState(accountId, {
+                            marker,
+                            seenMessageIds: recentSeenMessageIds(),
+                        });
+                    }
+                    catch (err) {
+                        log?.warn?.(`[MAX] polling state persist failed: ${err?.message ?? err}`);
+                    }
+                }
+            }
+        }
+        catch (err) {
+            if (signal?.aborted || err?.name === "AbortError")
+                return;
+            if (isTransientPollingError(err)) {
+                await new Promise((resolve) => setTimeout(resolve, delayMs));
+                delayMs = Math.min(delayMs * 2, MAX_DELAY_MS);
+                continue;
+            }
+            throw err;
+        }
+    }
 }
 async function runMaxAccount(ctx) {
     const account = ctx.account;
@@ -408,7 +681,7 @@ async function runMaxAccount(ctx) {
                 headers: { "content-type": "application/json", Authorization: account.token },
                 body: JSON.stringify({
                     url: account.webhookUrl,
-                    update_types: ["message_created", "bot_started"],
+                    update_types: ["message_created", "message_callback", "bot_started", "message_edited"],
                     ...(account.webhookSecret ? { secret: account.webhookSecret } : {}),
                 }),
             });
@@ -436,40 +709,13 @@ async function runMaxAccount(ctx) {
             await waitUntilAbort(ctx.abortSignal);
             return;
         }
-        bot.catch((err) => {
-            log?.error(`[MAX] Bot middleware error: ${err?.message ?? err}`);
-        });
-        bot.on("message_created", async (botCtx) => {
-            try {
-                await handler(botCtx.update ?? { update_type: "message_created", message: botCtx.message }, account.token);
-            }
-            catch (err) {
-                log?.error("[MAX] polling update failed: " + (err?.message ?? err));
-            }
-        });
-        bot.on("bot_started", async (botCtx) => {
-            try {
-                await handler(botCtx.update ?? botCtx, account.token);
-            }
-            catch (err) {
-                log?.error("[MAX] bot_started handling failed: " + (err?.message ?? err));
-            }
-        });
         log?.info("[MAX] Long polling started");
-        // max-bot-api 0.3.1 reads bot.botInfo.username in startPolling but only
-        // populates botInfo in the legacy start() flow — fetch it explicitly,
-        // otherwise polling dies instantly on a TypeError and retries forever.
-        try {
-            bot.botInfo = await bot.api.getMyInfo();
-        }
-        catch (err) {
-            log?.warn(`[MAX] getMyInfo failed before polling: ${err?.message ?? err}`);
-        }
-        // bot.startPolling() resolves when polling stops. max-bot-api ≥ 0.3.1
-        // retries transient errors internally and honors AbortSignal; the
-        // supervisor stays as a safety net for silent exits. Restarts use
-        // exponential backoff with jitter (5s → 5min) so a MAX-side outage is
-        // not hammered; a healthy run > 60s resets the delay.
+        // Own polling loop (the SDK's Polling keeps the marker in memory only):
+        // the marker + recent dedup ids are persisted AFTER each fully processed
+        // batch, so a gateway restart replays at most one batch and the persisted
+        // dedup snapshot absorbs it (at-least-once). Transient errors retry with
+        // exponential backoff inside the loop; anything else propagates to the
+        // account supervisor below.
         const MIN_RESTART_DELAY_MS = 5000;
         const MAX_RESTART_DELAY_MS = 5 * 60 * 1000;
         const HEALTHY_RUN_MS = 60000;
@@ -477,7 +723,14 @@ async function runMaxAccount(ctx) {
         const supervise = (async () => {
             while (!ctx.abortSignal?.aborted) {
                 const startedAt = Date.now();
-                await bot.startPolling({ allowedUpdates: ["message_created", "bot_started"] });
+                await runPollingLoop({
+                    bot,
+                    accountId: ctx.accountId,
+                    token: account.token,
+                    handler,
+                    signal: ctx.abortSignal,
+                    log,
+                });
                 if (ctx.abortSignal?.aborted)
                     break;
                 if (Date.now() - startedAt > HEALTHY_RUN_MS)
