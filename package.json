@@ -42,6 +42,7 @@
     "src/stickers.ts",
     "openclaw.plugin.json",
     "README.md",
+    "CHANGELOG.md",
     "LICENSE"
   ],
   "openclaw": {

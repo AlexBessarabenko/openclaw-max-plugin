@@ -27,6 +27,14 @@ Tested with OpenClaw **2026.9.3**, MAX Bot API v2 (`platform-api2.max.ru`).
 - ✅ **Scoped HTTP proxy** — optional per-account proxy for MAX API traffic only, without touching the rest of the gateway
 - ✅ **Agent prompt hints** — the plugin teaches the agent MAX Markdown rules, the 4000-char limit and delivery-target syntax via `agentPrompt`
 - ✅ **Inline keyboards** — the agent attaches buttons via `channelData.maxInlineKeyboard`; button presses arrive as inbound messages and are auto-acknowledged
+- ✅ **Message actions** — the agent edits/deletes its own messages, pins/unpins in chats, echoes stickers and sends native location pins / contact cards via the `message` tool
+- ✅ **`max_send_file` agent tool** — delivers a local file or an http(s) URL into the current MAX chat (media-roots confinement, SSRF-guarded download)
+- ✅ **Group policies** — `groupPolicy` (open/allowlist/disabled), per-group config with a `*` wildcard, `requireMention` (a reply to the bot counts as a mention)
+- ✅ **Reliable inbound** — persistent polling marker + dedup snapshot (at-least-once across restarts), `message_edited` tracking, send retry on `attachment.not.ready`
+- ✅ **Security hardening** — SSRF-guarded downloads, media-roots confinement for local sends, access check before any attachment download, attachment limits (≤10 files, ≤25 MB each)
+- ✅ **Send options** — per-message silent (`channelData.maxNotify`) and link-preview suppression (`maxDisableLinkPreview`), with channel-level defaults; remote images attach by URL without a re-upload
+- ✅ **Pairing approval notice** — the user gets a ✅ confirmation in MAX after `openclaw pairing approve --notify`
+- ✅ **Status diagnostics** — `openclaw channels status` reports a masked token preview, policies, transport mode and proxy state (`inspectAccount`)
 
 ## Installation
 
@@ -81,6 +89,12 @@ npm run build
 | `token` | Bot token from [MAX for Partners](https://partners.max.ru) (required) |
 | `dmPolicy` | `allowlist` (default), `open`, `closed` — who can DM the bot |
 | `allowFrom` | MAX user IDs allowed when policy is `allowlist` |
+| `groupPolicy` | `open` (default), `allowlist`, `disabled` — how the bot behaves in group chats (see "Group chats") |
+| `groupAllowFrom` | MAX user IDs allowed to trigger the bot in groups when `groupPolicy` is `allowlist` (empty = any member of an allowed group) |
+| `requireMention` | `false` (default) — in groups the bot answers only when @-mentioned or replied to |
+| `groups` | Per-group overrides keyed by chat id (or `"*"`): `{ "requireMention": bool, "enabled": bool }` |
+| `notify` | Channel default for outbound notifications; `false` = send silently. Per-message override: `channelData.maxNotify` |
+| `disableLinkPreview` | Channel default for suppressing link previews. Per-message override: `channelData.maxDisableLinkPreview` |
 | `webhookUrl` | Public URL of the `/max/webhook` route. When set, the plugin subscribes via `POST /subscriptions` automatically. When empty — long polling |
 | `webhookSecret` | Optional secret; verified against the `X-Max-Bot-Api-Secret` header |
 | `apiBaseUrl` | API override, default `https://platform-api2.max.ru` |
@@ -141,6 +155,23 @@ sudo update-ca-certificates
 export NODE_EXTRA_CA_CERTS=/etc/ssl/certs/russian_trusted_root_ca_pem.pem
 ```
 
+## Security
+
+- **Access check before download** — DM (`dmPolicy`/allowlist) and group policy gates
+  run before any attachment is fetched or written; a blocked sender cannot make the
+  plugin touch the network or disk.
+- **SSRF-guarded downloads** — all remote fetches (inbound attachments, outbound
+  media by URL, `max_send_file` URLs) go through the OpenClaw SSRF guard; image
+  URLs attached by link (no download) still get their host screened for
+  private/loopback addresses.
+- **Media confinement** — local files are read only through the gateway's media
+  reader or from the agent's allowed media roots; an agent-named arbitrary path is
+  refused.
+- **Attachment limits** — at most 10 attachments per message, 25 MB each; oversized
+  downloads abort before buffering.
+- **No token leakage** — diagnostics (`inspectAccount`) report only a masked
+  first4…last4 preview; the token never leaves the config.
+
 ## ⚠️ Privacy & Consent Notice
 
 This plugin talks **only** to the MAX Bot API. Any AI processing of message content
@@ -170,13 +201,16 @@ have configured.
 
 ### Webhook (recommended)
 
-Set `webhookUrl` to the public address of your gateway's `/max/webhook` route — the plugin registers the subscription with MAX itself (`update_types: message_created, bot_started`). Set `webhookSecret` so MAX signs deliveries.
+Set `webhookUrl` to the public address of your gateway's `/max/webhook` route — the plugin registers the subscription with MAX itself (`update_types: message_created, message_callback, bot_started, message_edited`). Set `webhookSecret` so MAX signs deliveries.
 
 ### Long polling
 
-Leave `webhookUrl` empty — the plugin polls `GET /updates` automatically. Restarts after
-transient errors use exponential backoff with jitter (5 s → 5 min, reset after a healthy
-minute) and are logged as `Long polling exited unexpectedly, restarting in Ns`.
+Leave `webhookUrl` empty — the plugin polls `GET /updates` automatically. The polling
+marker (plus a dedup snapshot) is **persisted after each fully processed batch**, so a
+gateway restart replays at most one batch and the snapshot absorbs it (at-least-once
+delivery). Restarts after transient errors use exponential backoff with jitter (5 s →
+5 min, reset after a healthy minute) and are logged as
+`Long polling exited unexpectedly, restarting in Ns`.
 
 ### Delivery targets (`message` tool, `openclaw message send`)
 
@@ -231,6 +265,81 @@ button presses. Pass buttons via the `message` tool's `channelData.maxInlineKeyb
   durable path (`openclaw message send --channel max …`) does not carry `channelData`,
   so no keyboard can be attached there.
 
+### Message actions (message tool)
+
+Since **0.5.0** the plugin owns a set of actions on the agent's shared `message` tool
+(plain text/media send stays on the core delivery path):
+
+```
+message(action="edit",    messageId="<mid>", message="new text")
+message(action="delete",  messageId="<mid>")
+message(action="pin",     target="<chat_id>", messageId="<mid>", notify=false)
+message(action="unpin",   target="<chat_id>")
+message(action="sticker", target="<chat_id>", stickerId="<code>")   // code optional
+message(action="sendAttachment", type="location", target="<chat_id>", latitude="55.75", longitude="37.62")
+message(action="sendAttachment", type="contact",  target="<chat_id>", contactName="Имя", vcfPhone="+79001234567")
+message(action="sendAttachment", type="contact",  target="<chat_id>", contactId="<max_user_id>")
+```
+
+- **Edit limits:** the bot's own messages can be edited up to **7 days** in dialogs;
+  messages with an inline keyboard and messages in groups/channels have **no time
+  limit**. Deletion has **no time limit**. MAX allows at most **2 edit/delete
+  operations per second per chat**.
+- **Stickers are echo-only:** there is no public sticker catalog API in MAX (a
+  scraped static catalog was rejected as brittle), so `stickerId` must be a code the
+  bot has actually seen. Incoming stickers arrive as `[Sticker (code …)]` markers;
+  the last code per chat is cached for 30 minutes — omitting `stickerId` resends it.
+  `replyTo` (a message id) is supported on sticker/location/contact sends.
+- **Contacts** use the snake_case wire payload (`vcf_info` VCard signed with an
+  HMAC of the bot token, or `max_info` for a MAX user id).
+
+### Sending files (`max_send_file` tool)
+
+Since **0.5.0** agents get a `max_send_file` tool that delivers a file into the
+**current** MAX chat (the chat is bound from the session's delivery context — the
+agent cannot redirect it elsewhere):
+
+- `path` — a local file inside the agent's allowed media roots (or session
+  workspace); or
+- `url` — an http(s) URL, downloaded through the SSRF guard;
+- `caption` — optional text sent with the file.
+
+The file type (image/video/audio/file) is derived from the filename and uploaded via
+the raw `POST /uploads` endpoint.
+
+### Group chats
+
+Since **0.5.0** group traffic is governed by `groupPolicy` (default `open`,
+preserving pre-0.5 behavior):
+
+- `disabled` — all group traffic is ignored;
+- `allowlist` — the chat must appear in `groups` (a `"*"` entry allows any group);
+  when `groupAllowFrom` is non-empty, the sender must be listed there too;
+- `open` — every group the bot joins is served (a startup warning is logged).
+
+`requireMention` (per-group → `"*"` → top-level, default `false`): the bot answers
+only when @-mentioned by username or when its own message is replied to; button
+presses on the bot's keyboard always count. A single group can be switched off with
+`enabled: false`. Downloads are gated the same way — a dropped message never
+triggers an attachment fetch.
+
+```json
+{
+  "channels": {
+    "max": {
+      "token": "…",
+      "groupPolicy": "allowlist",
+      "groupAllowFrom": ["123456789"],
+      "groups": {
+        "-900100": { "requireMention": true },
+        "-900200": { "enabled": false },
+        "*": { "requireMention": true }
+      }
+    }
+  }
+}
+```
+
 ### HTTP proxy
 
 `channels.max.httpProxy` (e.g. `http://proxy.local:3128`) routes **only** MAX API
@@ -244,14 +353,21 @@ authentication can be embedded in the URL (`http://user:pass@host:port`).
 | Type | Incoming | Outgoing | Notes |
 |------|----------|----------|-------|
 | Text | ✅ | ✅ | Markdown, chunked at 4000 chars |
-| Images | ✅ | ✅ | Saved to media store, analyzed via imageModel |
+| Images | ✅ | ✅ | Saved to media store, analyzed via imageModel; remote image URLs attach by link (no re-upload) |
 | Audio/Voice | ✅ | ⚠️ | Transcribed via gateway STT (`tools.media.audio`) |
-| Video | ✅ | ⚠️ | Saved to media store |
-| Files | ✅ | ⚠️ | PDFs analyzed via pdfModel |
+| Video | ✅ | ⚠️ | Saved to media store; token-only videos resolve a playback URL via `GET /videos/{token}` |
+| Files | ✅ | ⚠️ | PDFs analyzed via pdfModel; agent-served files via the `max_send_file` tool |
+| Stickers | ✅ | ✅ | Incoming arrive as `[Sticker (code …)]` (cached 30 min per chat); outgoing = echo by code (`action="sticker"`) |
+| Contacts | ✅ | ✅ | Incoming `[Contact: Name]`; outgoing via `sendAttachment type="contact"` |
+| Locations | ✅ | ✅ | Incoming as a Yandex Maps link; outgoing via `sendAttachment type="location"` |
+| Share cards | ✅ | — | Marked `[Shared: title (url)]` |
 | `bot_started` | ✅ | — | Becomes `/start [payload]` |
 | Forwarded | ✅ | — | Content unwrapped from `link.message`, marked `[Forwarded from …]`; media processed as usual |
 | Replies | ✅ | — | Quoted original shown as `[Reply to …: "…"]` (≤200 chars) |
-| Group chats | ✅ | ✅ | Per-chat sessions |
+| Edited messages | ✅ | ✅ | `message_edited` arrives marked `[Edited]`; the bot edits its own messages via `action="edit"` |
+| Keyboard buttons | ✅ | ✅ | Attach via `channelData.maxInlineKeyboard`; presses arrive as inbound messages |
+| Unknown types | ✅ | — | Marked `[Unsupported attachment: <type>]` so the agent knows something arrived |
+| Group chats | ✅ | ✅ | Per-chat sessions; `groupPolicy` / `requireMention` gates |
 
 ### Outgoing media
 
@@ -259,7 +375,15 @@ Since **0.3.5** the plugin implements the `sendMedia` outbound adapter: the agen
 `message` tool can attach images, video, audio and files from a URL or a local path
 (subject to the gateway's outbound-media access rules). Uploads go through the raw
 `POST /uploads` endpoint because max-bot-api 0.2.5 drops the upload token on the
-Buffer code path.
+Buffer code path. Since **0.5.0** http(s) **image** URLs are attached by link
+(`payload.url`, no re-upload) after a private/loopback host check; every other
+remote file is still downloaded through the SSRF guard and uploaded.
+
+Per-message send options (reply path, alongside the keyboard pattern):
+`channelData.maxNotify: false` sends silently, `channelData.maxDisableLinkPreview: true`
+suppresses link previews. Channel-wide defaults: `channels.max.notify` /
+`channels.max.disableLinkPreview`. The core `silent` flag maps to `notify: false`
+on the outbound adapter.
 
 ### Multimodal models (images & PDFs)
 
@@ -279,6 +403,7 @@ Buffer code path.
 ```bash
 npm run dev    # watch mode
 npm run build  # build to dist/
+npm test       # vitest + SDK import guard (check:sdk)
 ```
 
 ## Troubleshooting
@@ -287,6 +412,21 @@ npm run build  # build to dist/
 - Check the token (`GET /me` is verified at startup in webhook mode)
 - Without `webhookUrl` the plugin uses polling — make sure no webhook is stuck in MAX (delete it in bot settings)
 - With `dmPolicy: "allowlist"`, add your MAX user ID to `allowFrom`
+
+### Bot is silent in a group chat
+- With `groupPolicy: "allowlist"` the chat id (negative) must appear in `groups` (or be covered by `"*"`), and the sender in `groupAllowFrom` when it is non-empty
+- With `requireMention` the bot answers only when @-mentioned by username or replied to — check the log for `group message dropped: bot not mentioned`
+- Drops are always logged: `[MAX] group message dropped: <reason> (chat=<id>)`
+
+### A sticker action fails with "stickerId is required"
+- Stickers are echo-only: pass a code from a `[Sticker (code …)]` marker of a
+  recently received sticker (cached 30 minutes per chat), or have the user send a
+  sticker first. There is no sticker catalog.
+
+### Edit fails with "7 days in dialogs"
+- Bot messages in dialogs can be edited within 7 days; messages with an inline
+  keyboard or in groups/channels have no time limit. Deletion has no time limit.
+  Bursts are capped at 2 operations per second per chat.
 
 ### Messages arrive but no replies (`GatewayDrainingError`)
 - Symptom: gateway logs show `[MAX] inbound: …` followed by
