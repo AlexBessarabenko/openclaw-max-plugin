@@ -217,4 +217,45 @@ describe("message_callback → inbound", () => {
     expect(captured.inboundArgs.raw).toMatchObject({ chatId: "-900100", isGroup: true });
     expect(captured.turn.ctxPayload.conversation.kind).toBe("group");
   });
+
+  it("labels opaque presentation callbacks as callback_data, never as commands", async () => {
+    const { api, captured } = makeApi();
+    await handleUpdate(
+      api as any,
+      messageCallbackUpdate({
+        callback: {
+          timestamp: 1757190004,
+          callback_id: "cb-env",
+          payload: "mxcb1:vote:yes",
+          user: { user_id: 100200, name: "Egor" },
+        },
+      }),
+      "tok",
+    );
+    expect(captured.inboundArgs.raw.text).toBe('callback_data: vote:yes\n[Button on: "Голосуем?"]');
+    // plain ack, the agent turn runs as usual
+    expect(fakeBot.api.answerOnCallback).toHaveBeenCalledWith("cb-env", { notification: "\u200b" });
+  });
+
+  it("intercepts approval envelopes: runtime resolution, message replacement, no agent turn", async () => {
+    const { api } = makeApi();
+    await handleUpdate(
+      api as any,
+      messageCallbackUpdate({
+        callback: {
+          timestamp: 1757190005,
+          callback_id: "cb-appr",
+          payload: "mxa1:e:o:ap-9",
+          user: { user_id: 100200, name: "Egor" },
+        },
+      }),
+      "tok",
+    );
+    // No agent turn for operator controls.
+    expect(api.runtime.channel.inbound.run).not.toHaveBeenCalled();
+    // The keyboard message is replaced with a status line (buttons dropped).
+    expect(fakeBot.api.answerOnCallback).toHaveBeenCalledWith("cb-appr", {
+      message: { text: "Голосуем?\n\n⛔ You are not allowed to answer this." },
+    });
+  });
 });

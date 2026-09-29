@@ -5,6 +5,63 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0] - 2026-09-29
+
+### Added
+
+- **Platform voice transcription wins over gateway STT.** When a MAX audio
+  attachment already carries a server-side `transcription` (schema 0.0.33), it
+  is used directly and the gateway STT call is skipped. Downloads of
+  attachments get one retry on transient network failures.
+- **Outbound rate limiting.** A per-chat sliding-window limiter (2 messages per
+  second, the MAX platform limit) with FIFO queueing now covers every send
+  path: replies, streaming drafts, media/albums, stickers, pairing notices.
+  Edits, typing/read receipts and callback answers are not throttled.
+- **Webhook watchdog.** In webhook mode the subscription is re-verified every
+  12 minutes and transparently re-created (with the same URL/secret/update
+  types) when MAX dropped it.
+- **`channels.max.markSeen`** (default `true`) — the bot sends a `mark_seen`
+  read receipt once per inbound message, next to the typing indicator.
+- **`channels.max.commands`** — declarative bot-command registration
+  (`PATCH /me/commands`, up to 32 commands) applied at channel start.
+- **Structured mentions.** In groups with `requireMention`, a `user_mention`
+  element in `body.markup` referencing the bot by user id or `@user_link`
+  counts as a mention even when the visible text has no plain `@username`.
+- **Media albums.** Several attached images/videos are grouped into one album
+  message (up to 12, the MAX limit); audio and files always send individually.
+  The `message` tool result carries every sent message id
+  (`meta.messageIds`).
+- **Full presentation rendering.** `select` blocks render as inline buttons
+  (two per row, `placeholder` as an italic prompt); tables and charts render
+  as aligned monospace blocks; `presentation.title` renders bold with a tone
+  emoji (`info` ℹ️ / `success` ✅ / `warning` ⚠️ / `danger` ⛔). Presentation
+  buttons carry private callback envelopes: opaque values arrive labelled
+  `callback_data: <value>`, commands re-enter as slash commands.
+- **Operator buttons.** Presentation `approval` and ask-user `question` actions
+  resolve through OpenClaw's canonical approval/question gateway runtimes and
+  never enter the agent pipeline; the keyboard message is replaced with a
+  status line so a resolved control cannot be pressed twice. Approvals require
+  the pressing user to be listed explicitly in `channels.max.allowFrom` (a `*`
+  wildcard suffices for questions only).
+- **All MAX button wire types**: `callback`, `link`, `clipboard`, `message`
+  (sends the label as a user message), `request_contact`,
+  `request_geo_location` (`quick` supported), `open_app` (`web_app` + optional
+  slug `payload`/`contact_id`). Field limits validated against the schema
+  (label ≤ 128 chars, callback payload ≤ 1024 bytes, link URL ≤ 2048 chars).
+- **Schema-conformance test** against a snapshot of the official MAX API
+  schema (`src/__fixtures__/max-schema-0.0.33.yaml`); refresh with
+  `npm run schema:update`.
+
+### Changed
+
+- Pin/unpin in direct chats no longer calls the MAX API (pins are group-only):
+  the action returns `{ pinned: false, reason: "pins are not supported in
+  direct chats" }` instead of failing.
+- Update types the channel deliberately does not handle (`bot_added`,
+  `dialog_*`, `comment_*`, chat-administration events) are noted once per type
+  at debug level instead of vanishing silently.
+- Dev SDK bumped to OpenClaw 2026.9.6.
+
 ## [0.5.3] - 2026-09-09
 
 ### Security
@@ -133,6 +190,7 @@ Tested with OpenClaw **2026.9.3**.
 - **Agent prompt hints** — MAX Markdown rules, 4000-char limit and target syntax are
   taught to the agent via `agentPrompt`.
 
+[0.6.0]: https://github.com/AlexBessarabenko/openclaw-max-plugin/compare/v0.5.3...v0.6.0
 [0.5.3]: https://github.com/AlexBessarabenko/openclaw-max-plugin/compare/v0.5.2...v0.5.3
 [0.5.2]: https://github.com/AlexBessarabenko/openclaw-max-plugin/compare/v0.5.1...v0.5.2
 [0.5.1]: https://github.com/AlexBessarabenko/openclaw-max-plugin/compare/v0.5.0...v0.5.1

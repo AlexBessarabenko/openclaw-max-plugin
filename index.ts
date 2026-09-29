@@ -15,6 +15,9 @@ import {
 } from "./src/media-access.js";
 import { createMaxSendFileTool } from "./src/send-file-tool.js";
 import { isDuplicate } from "./src/dedup.js";
+import { acquireChatSendSlot } from "./src/send-limiter.js";
+import { decodeMaxPresentationCallback } from "./src/presentation.js";
+import { resolveMaxRuntimeControlCallback } from "./src/runtime-controls.js";
 import { rememberStickerCode } from "./src/stickers.js";
 import { groupChatAdmission } from "./src/chat-policy.js";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk/channel-core";
@@ -44,6 +47,10 @@ type InboundFacts = {
   attachments?: any[];
   /** Present on message_callback: id for POST /answers acknowledgement. */
   callbackId?: string;
+  /** Raw button payload (message_callback), before any text decoration. */
+  callbackPayload?: string;
+  /** Text of the message the pressed keyboard was attached to. */
+  callbackSourceText?: string;
   /**
    * Full delivery target override (`max:…`) for the reply path. Set on
    * message_callback without a source message: the bare user id is not a chat
@@ -53,6 +60,8 @@ type InboundFacts = {
   /** Present when the message is a reply: the original sender (for reply-to-bot mention). */
   replyToSenderId?: string;
   replyToSenderIsBot?: boolean;
+  /** body.markup elements (user_mention carries user_id / user_link="@username"). */
+  markup?: any[];
 };
 
 /**
@@ -97,6 +106,7 @@ function extractInboundFacts(update: any): InboundFacts | null {
     const linkBody = link?.message ?? {};
     let text = body.text ?? m.text ?? "";
     let attachments = m.attachments ?? body.attachments ?? undefined;
+    const markup = Array.isArray(body.markup) ? body.markup : undefined;
     const linkSenderName = link
       ? link.sender?.name ||
         [link.sender?.first_name, link.sender?.last_name].filter(Boolean).join(" ")
@@ -137,6 +147,7 @@ function extractInboundFacts(update: any): InboundFacts | null {
         isGroup: (recipient.chat_type ?? m.chat_type ?? "dialog") !== "dialog",
         timestamp: m.timestamp ?? update.timestamp,
         attachments,
+        markup,
         ...replyToSender,
       };
     }
@@ -151,6 +162,7 @@ function extractInboundFacts(update: any): InboundFacts | null {
       isGroup: (recipient.chat_type ?? m.chat_type ?? "dialog") !== "dialog",
       timestamp: m.timestamp,
       attachments,
+      markup,
       ...replyToSender,
     };
   }
@@ -193,7 +205,13 @@ function extractInboundFacts(update: any): InboundFacts | null {
         ? update.message.body.text.replace(/\s+/g, " ").trim()
         : "";
     const clipped = sourceText.length > 200 ? `${sourceText.slice(0, 199)}…` : sourceText;
-    const text = clipped ? `${payload}\n[Button on: "${clipped}"]` : payload;
+    // Presentation envelopes (mxcb1:) reach the agent labelled, never as a
+    // slash command; approval/question envelopes are intercepted in
+    // handleUpdate and resolved through the gateway runtimes instead.
+    const envelope = decodeMaxPresentationCallback(payload);
+    const displayPayload =
+      envelope?.kind === "callback" ? `callback_data: ${envelope.value}` : payload;
+    const text = clipped ? `${displayPayload}\n[Button on: "${clipped}"]` : displayPayload;
     return {
       messageId: `callback:${cb.callback_id}`,
       text,
@@ -206,6 +224,8 @@ function extractInboundFacts(update: any): InboundFacts | null {
       isGroup: (update.message?.recipient?.chat_type ?? "dialog") !== "dialog",
       timestamp: cb.timestamp,
       callbackId: cb.callback_id,
+      callbackPayload: payload,
+      callbackSourceText: sourceText || undefined,
     };
   }
 
@@ -242,6 +262,19 @@ async function downloadAttachment(url: string, token?: string): Promise<Buffer> 
     maxBytes: MAX_ATTACHMENT_BYTES,
   });
   return buffer;
+}
+
+/**
+ * One retry after a short pause absorbs transient network failures (a bare
+ * `fetch failed` while the gateway is still coming up).
+ */
+async function withTransientRetry<T>(run: () => Promise<T>, pauseMs = 1000): Promise<T> {
+  try {
+    return await run();
+  } catch {
+    await new Promise((resolve) => setTimeout(resolve, pauseMs));
+    return run();
+  }
 }
 
 /**
@@ -397,10 +430,27 @@ async function buildTextAndMedia(
 
     if (att.type === "audio") {
       const audioContentType = att?.payload?.contentType ?? "audio/ogg";
+      // Server-side transcription wins (AudioAttachment.transcription, schema
+      // 0.0.33): MAX currently does not send it, so the gateway STT path below
+      // stays the fallback.
+      const serverTranscript =
+        typeof att?.transcription === "string" && att.transcription.trim()
+          ? att.transcription.trim()
+          : null;
       try {
-        const buf = await downloadAttachment(url, att?.payload?.token ?? token);
+        const buf = await withTransientRetry(() =>
+          downloadAttachment(url, att?.payload?.token ?? token),
+        );
         if (!rt?.media?.saveMediaBuffer) {
-          media.push({ url, contentType: audioContentType, kind: "audio" });
+          if (serverTranscript) {
+            text = text ? `${text}\n[Voice]: ${serverTranscript}` : `[Voice]: ${serverTranscript}`;
+          }
+          media.push({
+            url,
+            contentType: audioContentType,
+            kind: "audio",
+            transcribed: Boolean(serverTranscript),
+          });
           continue;
         }
         const saved = await rt.media.saveMediaBuffer(
@@ -410,7 +460,9 @@ async function buildTextAndMedia(
           undefined,
           att?.payload?.filename,
         );
-        const transcript = await transcribeSavedAudio(api, saved.path, saved.contentType ?? audioContentType);
+        const transcript =
+          serverTranscript ??
+          (await transcribeSavedAudio(api, saved.path, saved.contentType ?? audioContentType));
         if (transcript) {
           text = text ? `${text}\n[Voice]: ${transcript}` : `[Voice]: ${transcript}`;
         }
@@ -542,10 +594,18 @@ async function runInbound(api: OpenClawPluginApi, facts: InboundFacts, token: st
           media: media.length > 0 ? media : undefined,
         });
 
+        // mark_seen once per inbound message (channels.max.markSeen, default
+        // true): the sender sees the bot has read the message. Fired from the
+        // first typing tick; the typing keepalive must not repeat it.
+        let markSeenSent = false;
         const sendTyping = async () => {
           const bot = getBot();
           // sendAction needs a real chat id — no chat exists on the user-target path
           if (bot && replyUserId == null) {
+            if (!markSeenSent && (cfg.channels as any)?.[MAX_CHANNEL_ID]?.markSeen !== false) {
+              markSeenSent = true;
+              bot.api.sendAction(Number(chatId), "mark_seen" as any).catch(() => {});
+            }
             await bot.api.sendAction(Number(chatId), "typing_on");
           }
         };
@@ -562,8 +622,12 @@ async function runInbound(api: OpenClawPluginApi, facts: InboundFacts, token: st
           extra?: Record<string, unknown>,
         ): Promise<any> =>
           replyUserId != null
-            ? bot.api.sendMessageToUser(replyUserId, text, extra as any)
-            : bot.api.sendMessageToChat(Number(chatId), text, extra as any);
+            ? acquireChatSendSlot(`user:${replyUserId}`).then(() =>
+                bot.api.sendMessageToUser(replyUserId, text, extra as any),
+              )
+            : acquireChatSendSlot(`chat:${chatId}`).then(() =>
+                bot.api.sendMessageToChat(Number(chatId), text, extra as any),
+              );
 
         // --- Draft streaming: cumulative partial replies edit one draft message ---
         const streamingEnabled = (cfg.channels as any)?.[MAX_CHANNEL_ID]?.streaming !== false;
@@ -899,6 +963,7 @@ async function checkDmAccess(api: OpenClawPluginApi, facts: InboundFacts): Promi
         senderIdLine: `maxUserId: ${facts.senderId}`,
         sendPairingReply: async (text: string) => {
           if (bot) {
+            await acquireChatSendSlot(`user:${facts.senderId}`);
             await bot.api.sendMessageToUser(Number(facts.senderId), text, { format: "markdown" });
           }
         },
@@ -1005,12 +1070,66 @@ async function checkGroupAccess(api: OpenClawPluginApi, facts: InboundFacts): Pr
     if (mentionRe.test(facts.text)) return true;
   }
 
+  // Structured mentions: a body.markup user_mention element references the bot
+  // by user_id or user_link even when the visible text has no plain @username.
+  for (const el of facts.markup ?? []) {
+    if (el?.type !== "user_mention") continue;
+    if (identity.userId != null && el.user_id != null && Number(el.user_id) === identity.userId) {
+      return true;
+    }
+    const link = typeof el.user_link === "string" ? el.user_link.replace(/^@/, "") : "";
+    if (identity.username && link.toLowerCase() === identity.username.toLowerCase()) return true;
+  }
+
   return drop("bot not mentioned (requireMention)");
+}
+
+/**
+ * Update types defined by the MAX API schema that this channel deliberately
+ * does not handle (chat-administration and comment-thread events). Anything
+ * not in this list and not handled is an unknown type worth a debug note.
+ */
+export const MAX_IGNORED_UPDATE_TYPES = [
+  "message_removed",
+  "comment_created",
+  "comment_edited",
+  "comment_removed",
+  "bot_added",
+  "bot_removed",
+  "user_added",
+  "user_removed",
+  "bot_started",
+  "bot_stopped",
+  "dialog_cleared",
+  "dialog_removed",
+  "dialog_muted",
+  "dialog_unmuted",
+  "chat_title_changed",
+  "bot_admin_permissions_changed",
+] as const;
+
+/** Update types this channel processes in extractInboundFacts. */
+export const MAX_HANDLED_UPDATE_TYPES = [
+  "message_created",
+  "message_edited",
+  "message_callback",
+] as const;
+
+const loggedIgnoredUpdateTypes = new Set<string>();
+
+/** One debug note per update type per process — never the update payload. */
+function noteIgnoredUpdateType(api: OpenClawPluginApi, type: unknown): void {
+  if (typeof type !== "string" || loggedIgnoredUpdateTypes.has(type)) return;
+  loggedIgnoredUpdateTypes.add(type);
+  api.logger.debug?.(`[MAX] ignored update type: ${type}`);
 }
 
 /** Shared update handler for webhook and polling transports. */
 export async function handleUpdate(api: OpenClawPluginApi, update: any, token: string): Promise<void> {  const facts = extractInboundFacts(update);
-  if (!facts) return;
+  if (!facts) {
+    noteIgnoredUpdateType(api, update?.update_type);
+    return;
+  }
 
   // Loop protection: never react to other bots (or our own echo)
   if (facts.senderIsBot) return;
@@ -1018,6 +1137,34 @@ export async function handleUpdate(api: OpenClawPluginApi, update: any, token: s
   if (isDuplicate(facts.messageId)) {
     api.logger.info(`[MAX] duplicate message ${facts.messageId} ignored`);
     return;
+  }
+
+  // Operator controls (approval / ask_user buttons on presentation keyboards)
+  // resolve through the canonical gateway runtimes and never enter the agent
+  // pipeline. The callback answer replaces the keyboard message with a status
+  // line, so a resolved control cannot be pressed twice.
+  if (facts.callbackId && facts.callbackPayload) {
+    const control = decodeMaxPresentationCallback(facts.callbackPayload);
+    if (control?.kind === "approval" || control?.kind === "question") {
+      const bot = getBot();
+      if (bot) {
+        const cfg = (api as any).runtime?.config?.current?.() ?? (api as any).config ?? {};
+        const section = (cfg as any)?.channels?.[MAX_CHANNEL_ID] ?? {};
+        await resolveMaxRuntimeControlCallback({
+          action: control,
+          cfg,
+          accountId: DEFAULT_ACCOUNT_ID,
+          senderId: facts.senderId,
+          allowFrom: Array.isArray(section.allowFrom) ? section.allowFrom : [],
+          sourceText: facts.callbackSourceText,
+          answerCallback: async (body) => {
+            await bot.api.answerOnCallback(facts.callbackId!, body as any);
+          },
+          log: { warn: (m) => api.logger.warn(m), error: (m) => api.logger.error(m) },
+        });
+      }
+      return;
+    }
   }
 
   // Inline keyboard callbacks: MAX shows a spinner on the button until the

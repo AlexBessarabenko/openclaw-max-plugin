@@ -4,8 +4,9 @@ import { z } from "zod";
  *
  * Wire format (MAX Bot API v2, `attachments` on send/edit):
  *   { type: "inline_keyboard", payload: { buttons: Button[][] } }
- * where each inner array is a row (ported from evgeniyvbystrov/openclaw-max
- * `send.ts`; types verified against `@maxhub/max-bot-api@0.3.1`).
+ * where each inner array is a row. Supported button types (verified against
+ * the MAX API schema 0.0.33): callback, link, clipboard, message,
+ * request_contact, request_geo_location, open_app.
  *
  * Official limits (dev.max.ru → «Клавиатуры»):
  *   - up to 210 buttons per keyboard
@@ -35,6 +36,22 @@ export declare const MaxButtonSchema: z.ZodDiscriminatedUnion<[z.ZodObject<{
     type: z.ZodLiteral<"clipboard">;
     text: z.ZodString;
     payload: z.ZodString;
+}, z.core.$strip>, z.ZodObject<{
+    type: z.ZodLiteral<"message">;
+    text: z.ZodString;
+}, z.core.$strip>, z.ZodObject<{
+    type: z.ZodLiteral<"request_contact">;
+    text: z.ZodString;
+}, z.core.$strip>, z.ZodObject<{
+    type: z.ZodLiteral<"request_geo_location">;
+    text: z.ZodString;
+    quick: z.ZodOptional<z.ZodBoolean>;
+}, z.core.$strip>, z.ZodObject<{
+    type: z.ZodLiteral<"open_app">;
+    text: z.ZodString;
+    web_app: z.ZodString;
+    payload: z.ZodOptional<z.ZodString>;
+    contact_id: z.ZodOptional<z.ZodNullable<z.ZodNumber>>;
 }, z.core.$strip>], "type">;
 export type MaxButton = z.infer<typeof MaxButtonSchema>;
 /** Keyboard error with a human-readable constraint message. */

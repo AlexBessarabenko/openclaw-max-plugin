@@ -108,6 +108,44 @@ describe("MAX keyboard limits", () => {
   });
 });
 
+describe("extended wire button types (MAX API schema 0.0.33)", () => {
+  it("passes through message / request_contact / request_geo_location / open_app buttons", () => {
+    const wire = [
+      [
+        { type: "message", text: "Подтвердить" },
+        { type: "request_contact", text: "Отправить контакт" },
+        { type: "request_geo_location", text: "Где я", quick: true },
+      ],
+      [
+        { type: "open_app", text: "Открыть", web_app: "mybot", payload: "start-1" },
+        { type: "open_app", text: "Без payload", web_app: "mybot", contact_id: null },
+      ],
+    ];
+    expect(parseInlineKeyboardInput(wire)).toEqual(wire);
+  });
+
+  it("open_app requires web_app and a slug-like payload", () => {
+    expect(() => parseInlineKeyboardInput([[{ type: "open_app", text: "x" }]])).toThrow();
+    expect(() =>
+      parseInlineKeyboardInput([[{ type: "open_app", text: "x", web_app: "b", payload: "not slug!" }]]),
+    ).toThrow();
+    expect(() =>
+      parseInlineKeyboardInput([
+        [{ type: "open_app", text: "x", web_app: "b", payload: `a${"b".repeat(512)}` }],
+      ]),
+    ).toThrow(); // 513 chars > maxLength 512
+  });
+
+  it("request_geo_location defaults quick to absent (MAX default false)", () => {
+    const rows = parseInlineKeyboardInput([[{ type: "request_geo_location", text: "Где я" }]]);
+    expect(rows).toEqual([[{ type: "request_geo_location", text: "Где я" }]]);
+  });
+
+  it("rejects unknown button types", () => {
+    expect(() => parseInlineKeyboardInput([[{ type: "game" as any, text: "x" }]])).toThrow();
+  });
+});
+
 describe("toInlineKeyboardAttachment", () => {
   it("serializes rows into the MAX attachments wire format", () => {
     const rows = parseInlineKeyboardInput([[{ text: "OK", payload: "ok" }]]);

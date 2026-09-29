@@ -13,8 +13,9 @@ import type { MessagePresentationButton } from "openclaw/plugin-sdk/interactive-
  *
  * Wire format (MAX Bot API v2, `attachments` on send/edit):
  *   { type: "inline_keyboard", payload: { buttons: Button[][] } }
- * where each inner array is a row (ported from evgeniyvbystrov/openclaw-max
- * `send.ts`; types verified against `@maxhub/max-bot-api@0.3.1`).
+ * where each inner array is a row. Supported button types (verified against
+ * the MAX API schema 0.0.33): callback, link, clipboard, message,
+ * request_contact, request_geo_location, open_app.
  *
  * Official limits (dev.max.ru → «Клавиатуры»):
  *   - up to 210 buttons per keyboard
@@ -42,26 +43,50 @@ const RESTRICTED_ROW_BUTTON_TYPES = new Set([
   "request_contact",
 ]);
 
-/** Button types accepted by this plugin (MVP-1 scope). */
+/** Button wire types, field-for-field from the MAX API schema (0.0.33). */
 const CallbackButtonSchema = z.object({
   type: z.literal("callback"),
-  text: z.string().min(1),
-  payload: z.string(),
+  text: z.string().min(1).max(128),
+  payload: z.string().max(1024),
 });
 const LinkButtonSchema = z.object({
   type: z.literal("link"),
-  text: z.string().min(1),
-  url: z.string().url(),
+  text: z.string().min(1).max(128),
+  url: z.string().url().max(2048),
 });
 const ClipboardButtonSchema = z.object({
   type: z.literal("clipboard"),
-  text: z.string().min(1),
-  payload: z.string(),
+  text: z.string().min(1).max(128),
+  payload: z.string().max(1024),
+});
+const MessageButtonSchema = z.object({
+  type: z.literal("message"),
+  text: z.string().min(1).max(128),
+});
+const RequestContactButtonSchema = z.object({
+  type: z.literal("request_contact"),
+  text: z.string().min(1).max(128),
+});
+const RequestGeoLocationButtonSchema = z.object({
+  type: z.literal("request_geo_location"),
+  text: z.string().min(1).max(128),
+  quick: z.boolean().optional(),
+});
+const OpenAppButtonSchema = z.object({
+  type: z.literal("open_app"),
+  text: z.string().min(1).max(128),
+  web_app: z.string().min(1),
+  payload: z.string().regex(/^[\w-]*$/).max(512).optional(),
+  contact_id: z.number().int().nullable().optional(),
 });
 export const MaxButtonSchema = z.discriminatedUnion("type", [
   CallbackButtonSchema,
   LinkButtonSchema,
   ClipboardButtonSchema,
+  MessageButtonSchema,
+  RequestContactButtonSchema,
+  RequestGeoLocationButtonSchema,
+  OpenAppButtonSchema,
 ]);
 export type MaxButton = z.infer<typeof MaxButtonSchema>;
 
@@ -91,8 +116,16 @@ export class MaxKeyboardError extends Error {
   }
 }
 
-/** Button types accepted by this plugin (MVP-1 scope). */
-const SUPPORTED_BUTTON_TYPES = new Set(["callback", "link", "clipboard"]);
+/** Button types accepted by this plugin (MAX API schema 0.0.33). */
+const SUPPORTED_BUTTON_TYPES = new Set([
+  "callback",
+  "link",
+  "clipboard",
+  "message",
+  "request_contact",
+  "request_geo_location",
+  "open_app",
+]);
 
 function normalizeInputButton(input: z.infer<typeof ButtonInputSchema>): MaxButton {
   if (typeof input === "string") {
@@ -102,7 +135,7 @@ function normalizeInputButton(input: z.infer<typeof ButtonInputSchema>): MaxButt
     const type = (input as { type: unknown }).type;
     if (!SUPPORTED_BUTTON_TYPES.has(String(type))) {
       throw new MaxKeyboardError(
-        `unsupported button type "${String(type)}" (supported: callback, link, clipboard)`,
+        `unsupported button type "${String(type)}" (supported: ${[...SUPPORTED_BUTTON_TYPES].join(", ")})`,
       );
     }
     return input as unknown as MaxButton;

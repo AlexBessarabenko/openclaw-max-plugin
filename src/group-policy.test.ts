@@ -70,13 +70,13 @@ function makeApi(channelConfig: Record<string, unknown>) {
 }
 
 let midSeq = 0;
-function groupMessage(text: string, opts: { chatId?: number; senderId?: number; link?: any; withAttachment?: boolean } = {}) {
+function groupMessage(text: string, opts: { chatId?: number; senderId?: number; link?: any; withAttachment?: boolean; markup?: any[] } = {}) {
   return {
     update_type: "message_created",
     message: {
       sender: { user_id: opts.senderId ?? 100200, name: "Egor" },
       recipient: { chat_id: opts.chatId ?? -900100, chat_type: "chat" },
-      body: { mid: `g-${++midSeq}`, text },
+      body: { mid: `g-${++midSeq}`, text, ...(opts.markup ? { markup: opts.markup } : {}) },
       ...(opts.link ? { link: opts.link } : {}),
       attachments: opts.withAttachment
         ? [{ type: "image", payload: { url: "https://cdn.max.ru/pic.jpg" } }]
@@ -202,6 +202,42 @@ describe("requireMention", () => {
     const blocked = makeApi({ groupPolicy: "allowlist", groups: { "-111": {} } });
     await handleUpdate(blocked.api as any, groupCallback(-900100), "tok");
     expect(blocked.api.runtime.channel.inbound.run).not.toHaveBeenCalled();
+  });
+
+  it("markup user_mention by user_id counts as a mention", async () => {
+    const { api } = makeApi(cfg);
+    await handleUpdate(
+      api as any,
+      groupMessage("привет бот", {
+        markup: [{ type: "user_mention", from: 6, length: 3, user_id: 777 }],
+      }),
+      "tok",
+    );
+    expect(api.runtime.channel.inbound.run).toHaveBeenCalledTimes(1);
+  });
+
+  it("markup user_mention by user_link counts as a mention (case-insensitive)", async () => {
+    const { api } = makeApi(cfg);
+    await handleUpdate(
+      api as any,
+      groupMessage("привет бот", {
+        markup: [{ type: "user_mention", from: 6, length: 3, user_link: "@Test_Bot" }],
+      }),
+      "tok",
+    );
+    expect(api.runtime.channel.inbound.run).toHaveBeenCalledTimes(1);
+  });
+
+  it("markup user_mention of another user is not a mention", async () => {
+    const { api } = makeApi(cfg);
+    await handleUpdate(
+      api as any,
+      groupMessage("@someone_else привет", {
+        markup: [{ type: "user_mention", from: 0, length: 12, user_id: 999, user_link: "@someone_else" }],
+      }),
+      "tok",
+    );
+    expect(api.runtime.channel.inbound.run).not.toHaveBeenCalled();
   });
 });
 

@@ -8,9 +8,11 @@ import { getAgentScopedMediaLocalRoots } from "openclaw/plugin-sdk/media-runtime
 import { downloadRemoteMedia, readLocalMedia } from "./src/media-access.js";
 import { isPrivateOrLoopbackHost } from "openclaw/plugin-sdk/ssrf-runtime";
 import { primeSeenMessageIds, recentSeenMessageIds } from "./src/dedup.js";
+import { acquireChatSendSlot } from "./src/send-limiter.js";
 import { loadMaxPollingState, saveMaxPollingState } from "./src/polling-state.js";
 import { maxMessageActions } from "./src/actions.js";
-import { MAX_KEYBOARD_LIMITS, MAX_PRESENTATION_ROW_SIZE, presentationToMaxButtons, resolvePayloadKeyboardButtons, toInlineKeyboardAttachment, } from "./src/keyboards.js";
+import { MAX_KEYBOARD_LIMITS, MAX_PRESENTATION_ROW_SIZE, parseInlineKeyboardInput, resolvePayloadKeyboardButtons, toInlineKeyboardAttachment, } from "./src/keyboards.js";
+import { renderMaxPresentationParts, } from "./src/presentation.js";
 import { normalizeMessagePresentation, renderMessagePresentationFallbackText, } from "openclaw/plugin-sdk/interactive-runtime";
 export const MAX_CHANNEL_ID = "max";
 export const DEFAULT_ACCOUNT_ID = "default";
@@ -33,6 +35,7 @@ export function resolveAccount(cfg, accountId) {
         webhookSecret: section?.webhookSecret,
         apiBaseUrl: section?.apiBaseUrl ?? DEFAULT_API_BASE_URL,
         httpProxy: section?.httpProxy,
+        commands: section?.commands,
     };
 }
 /** Strip routing prefixes ("max:", "max:group:") from a delivery target. */
@@ -68,6 +71,10 @@ function resolveSendTarget(to) {
         return { userId: Number(t.slice(5)) };
     return { chatId: Number(t) };
 }
+/** Limiter key for a resolved target: one window per chat / per DM user. */
+function sendLimiterKey(target) {
+    return "userId" in target ? `user:${target.userId}` : `chat:${target.chatId}`;
+}
 /**
  * MAX processes fresh uploads asynchronously; sending right after an upload
  * can fail with `attachment.not.ready`. Retry the SEND (never the upload)
@@ -80,6 +87,7 @@ export async function sendMaxMessage(bot, to, text, extra) {
     const target = resolveSendTarget(to);
     const hasAttachments = Array.isArray(extra?.attachments) && extra.attachments.length > 0;
     const maxAttempts = hasAttachments ? 1 + ATTACHMENT_RETRY_DELAYS_MS.length : 1;
+    await acquireChatSendSlot(sendLimiterKey(target));
     for (let attempt = 1;; attempt++) {
         try {
             return "userId" in target
@@ -112,6 +120,7 @@ export async function sendMaxBody(bot, to, body) {
         ...(body.format ? { format: body.format } : {}),
         ...(body.notify !== undefined ? { notify: body.notify } : {}),
     };
+    await acquireChatSendSlot(sendLimiterKey(target));
     const res = "userId" in target
         ? await bot.api.raw.messages.send({ user_id: target.userId, ...payload })
         : await bot.api.raw.messages.send({ chat_id: target.chatId, ...payload });
@@ -206,15 +215,14 @@ function extractSentMessageId(sent) {
     return mid != null ? String(mid) : String(Date.now());
 }
 /**
- * Send one media message. Remote image URLs ride by URL (attachment
- * payload.url) — MAX fetches the link server-side, no upload round trip;
- * the host is screened the same way the download path is (private/loopback
- * hosts are refused). Everything else (non-image URLs, local files) goes
- * through the SSRF-guarded download + upload flow.
+ * Resolve one media source (remote URL or local path) into a wire attachment.
+ * Remote image URLs ride by URL (attachment payload.url) — MAX fetches the
+ * link server-side, no upload round trip; the host is screened the same way
+ * the download path is (private/loopback hosts are refused). Everything else
+ * (non-image URLs, local files) goes through the SSRF-guarded
+ * download + upload flow.
  */
-export async function sendMaxMedia(bot, params) {
-    const mediaUrl = params.mediaUrl;
-    let attachment;
+async function resolveMaxMediaAttachment(bot, mediaUrl, params) {
     if (/^https?:\/\//i.test(mediaUrl)) {
         const filename = decodeURIComponent(new URL(mediaUrl).pathname.split("/").pop() ?? "") || "file";
         if (resolveMaxUploadType(filename) === "image") {
@@ -222,29 +230,87 @@ export async function sendMaxMedia(bot, params) {
             if (isPrivateOrLoopbackHost(host)) {
                 throw new Error(`refusing to send image by URL: private or loopback host "${host}"`);
             }
-            attachment = { type: "image", payload: { url: mediaUrl } };
+            return { type: "image", payload: { url: mediaUrl } };
         }
-        else {
-            // SSRF-guarded download; scoped MAX fetch (CA/proxy) stays in effect
-            const fetched = await downloadRemoteMedia({ url: mediaUrl, fetchImpl: getMaxFetch() });
-            attachment = await rawUploadMaxMedia(bot, resolveMaxUploadType(filename, fetched.contentType || undefined), fetched.buffer, filename);
-        }
+        // SSRF-guarded download; scoped MAX fetch (CA/proxy) stays in effect
+        const fetched = await downloadRemoteMedia({ url: mediaUrl, fetchImpl: getMaxFetch() });
+        return rawUploadMaxMedia(bot, resolveMaxUploadType(filename, fetched.contentType || undefined), fetched.buffer, filename);
     }
-    else {
-        // Local paths only via the host reader or inside the allowed media
-        // roots — otherwise an agent-named path could exfiltrate any file.
-        const data = await readLocalMedia(mediaUrl, {
-            mediaReadFile: params.mediaReadFile,
-            mediaLocalRoots: params.mediaLocalRoots,
-        });
-        const filename = mediaUrl.split("/").pop() || "file";
-        attachment = await rawUploadMaxMedia(bot, resolveMaxUploadType(filename), data, filename);
-    }
+    // Local paths only via the host reader or inside the allowed media
+    // roots — otherwise an agent-named path could exfiltrate any file.
+    const data = await readLocalMedia(mediaUrl, {
+        mediaReadFile: params.mediaReadFile,
+        mediaLocalRoots: params.mediaLocalRoots,
+    });
+    const filename = mediaUrl.split("/").pop() || "file";
+    return rawUploadMaxMedia(bot, resolveMaxUploadType(filename), data, filename);
+}
+/**
+ * Send one media message. Remote image URLs ride by URL (attachment
+ * payload.url) — MAX fetches the link server-side, no upload round trip;
+ * the host is screened the same way the download path is (private/loopback
+ * hosts are refused). Everything else (non-image URLs, local files) goes
+ * through the SSRF-guarded download + upload flow.
+ */
+export async function sendMaxMedia(bot, params) {
+    const attachment = await resolveMaxMediaAttachment(bot, params.mediaUrl, params);
     const sent = await sendMaxMessage(bot, params.to, params.text ?? "", {
         ...(params.extra ?? {}),
         attachments: [attachment],
     });
     return extractSentMessageId(sent);
+}
+/** MAX renders albums of up to 12 photo/video attachments in one message. */
+export const MAX_ALBUM_SIZE = 12;
+/**
+ * Group outbound media into as few messages as MAX allows: images and videos
+ * form albums of up to 12, audio/files always go one per message. Grouping is
+ * decided by the upload type resolved from the filename/extension.
+ */
+export function groupMaxMediaUrls(mediaUrls) {
+    const groups = [];
+    let album = [];
+    const flush = () => {
+        if (album.length > 0)
+            groups.push(album);
+        album = [];
+    };
+    for (const mediaUrl of mediaUrls) {
+        const filename = mediaUrl.split("?")[0].split("#")[0].split("/").pop();
+        const type = resolveMaxUploadType(filename);
+        if (type === "image" || type === "video") {
+            if (album.length >= MAX_ALBUM_SIZE)
+                flush();
+            album.push(mediaUrl);
+        }
+        else {
+            flush();
+            groups.push([mediaUrl]);
+        }
+    }
+    flush();
+    return groups;
+}
+/**
+ * Send several media as few messages as MAX allows (albums of up to 12
+ * images/videos; audio/files one per message). The caption rides on the first
+ * message only. Returns the message id of each sent message.
+ */
+export async function sendMaxMediaGroup(bot, params) {
+    const groups = groupMaxMediaUrls(params.mediaUrls);
+    const messageIds = [];
+    for (let i = 0; i < groups.length; i++) {
+        const attachments = [];
+        for (const mediaUrl of groups[i]) {
+            attachments.push(await resolveMaxMediaAttachment(bot, mediaUrl, params));
+        }
+        const sent = await sendMaxMessage(bot, params.to, i === 0 ? (params.text ?? "") : "", {
+            ...(params.extra ?? {}),
+            attachments: attachments,
+        });
+        messageIds.push(extractSentMessageId(sent));
+    }
+    return messageIds;
 }
 // Store bot instance for outbound messaging
 let botInstance = null;
@@ -278,6 +344,7 @@ export async function sendMaxPairingApproval(bot, id) {
     if (!Number.isFinite(userId)) {
         throw new Error(`pairing id "${id}" is not a MAX user id`);
     }
+    await acquireChatSendSlot(`user:${userId}`);
     await bot.api.sendMessageToUser(userId, "✅ Доступ одобрен. Можете продолжать диалог с ботом.", { format: "markdown" });
 }
 /** Masked token preview for diagnostics: first/last 4 chars, never the secret. */
@@ -320,40 +387,49 @@ const MAX_OUTBOUND_TEXT_LIMIT = 4000;
 const MAX_CONTROL_ONLY_FALLBACK = "Choose an option.";
 /**
  * Convert a portable `presentation` payload into the one MAX payload shape
- * used by every outbound funnel (mirrors the core Telegram adapter): buttons
- * blocks become `channelData.maxInlineKeyboard`, everything else degrades to
- * fallback text. Called by the core via `outbound.renderPresentation` after
- * the presentation was adapted to `presentationCapabilities` — so by this
- * point unsupported blocks (selects, tables, …) are already text.
+ * used by every outbound funnel: the full block set renders to MAX markdown
+ * (title/tone line, context, dividers, monospace tables/charts), buttons and
+ * select options become `channelData.maxInlineKeyboard` rows carrying private
+ * callback envelopes (see src/presentation.ts). Called by the core via
+ * `outbound.renderPresentation` after the presentation was adapted to
+ * `presentationCapabilities`.
  */
 export function canonicalizeMaxPresentationPayload(payload) {
     const presentation = normalizeMessagePresentation(payload.presentation);
     if (!presentation)
         return payload;
+    const currentText = payload.text?.trim() ?? "";
+    // presentationTextMode "fallback" marks payload.text as core's own plain
+    // fallback of the presentation — replace it with our richer render. The
+    // endsWith guard catches the same duplication when the mode flag is absent.
+    const plainBlocks = presentation.blocks.filter((block) => block.type !== "buttons" && block.type !== "select");
+    const plainFallback = renderMessagePresentationFallbackText({
+        presentation: { ...presentation, blocks: plainBlocks },
+    });
+    const textIsFallback = payload.presentationTextMode === "fallback";
+    const alreadyHasFallback = !textIsFallback &&
+        plainFallback.length > 0 &&
+        (currentText === plainFallback || currentText.endsWith(`\n\n${plainFallback}`));
+    const baseText = textIsFallback || !currentText
+        ? ""
+        : alreadyHasFallback
+            ? currentText
+                .slice(0, currentText.length - plainFallback.length)
+                .replace(/\n\n$/u, "")
+                .trimEnd()
+            : currentText;
+    const rendered = renderMaxPresentationParts({ presentation, text: baseText });
     let keyboard = null;
     try {
-        keyboard = presentationToMaxButtons(presentation);
+        keyboard = rendered.buttons.length > 0 ? parseInlineKeyboardInput(rendered.buttons) : null;
     }
     catch {
         keyboard = null; // over-limit keyboards degrade to text-only delivery
     }
-    const textBlocks = presentation.blocks.filter((block) => block.type !== "buttons");
-    const fallbackText = renderMessagePresentationFallbackText({
-        presentation: { ...presentation, blocks: textBlocks },
-    });
-    const currentText = payload.text?.trim() ?? "";
-    const textIsFallback = payload.presentationTextMode === "fallback";
-    const alreadyHasFallback = fallbackText.length > 0 &&
-        (currentText === fallbackText || currentText.endsWith(`\n\n${fallbackText}`));
-    const text = textIsFallback
-        ? currentText || fallbackText
-        : alreadyHasFallback
-            ? currentText
-            : [currentText, fallbackText].filter(Boolean).join("\n\n");
     const { presentation: _presentation, presentationTextMode: _mode, ...rest } = payload;
     return {
         ...rest,
-        text: text || (keyboard ? MAX_CONTROL_ONLY_FALLBACK : ""),
+        text: rendered.text || (keyboard ? MAX_CONTROL_ONLY_FALLBACK : ""),
         ...(keyboard
             ? { channelData: { ...(payload.channelData ?? {}), maxInlineKeyboard: keyboard } }
             : {}),
@@ -386,6 +462,7 @@ async function sendMaxPayload(ctx) {
         text = MAX_CONTROL_ONLY_FALLBACK;
     const replyLink = ctx.replyToId ? { link: { type: "reply", mid: String(ctx.replyToId) } } : {};
     let lastMessageId = "";
+    const sentMessageIds = [];
     if (text) {
         const chunks = [];
         for (let i = 0; i < text.length; i += MAX_OUTBOUND_TEXT_LIMIT) {
@@ -409,6 +486,7 @@ async function sendMaxPayload(ctx) {
                 sent = await sendMaxMessage(bot, ctx.to, chunks[i], plainExtra);
             }
             lastMessageId = extractSentMessageId(sent);
+            sentMessageIds.push(lastMessageId);
         }
     }
     const mediaUrls = [
@@ -416,21 +494,26 @@ async function sendMaxPayload(ctx) {
             .filter((u) => typeof u === "string" && Boolean(u.trim()))
             .map((u) => u.trim())),
     ];
-    for (const mediaUrl of mediaUrls) {
-        const mid = await sendMaxMedia(bot, {
-            to: ctx.to,
-            text: "",
-            mediaUrl,
-            mediaReadFile: ctx.mediaReadFile,
-            mediaLocalRoots: ctx.mediaLocalRoots ?? getAgentScopedMediaLocalRoots(ctx.cfg),
-            extra: { ...opts, ...(lastMessageId ? {} : replyLink) },
-        });
-        if (mid)
-            lastMessageId = mid;
+    // Albums: images/videos group up to 12 per message, audio/files go singly.
+    const mediaIds = await sendMaxMediaGroup(bot, {
+        to: ctx.to,
+        text: "",
+        mediaUrls,
+        mediaReadFile: ctx.mediaReadFile,
+        mediaLocalRoots: ctx.mediaLocalRoots ?? getAgentScopedMediaLocalRoots(ctx.cfg),
+        extra: { ...opts, ...(lastMessageId ? {} : replyLink) },
+    });
+    if (mediaIds.length > 0) {
+        lastMessageId = mediaIds[mediaIds.length - 1];
+        sentMessageIds.push(...mediaIds);
     }
     if (!lastMessageId)
         throw new Error("MAX sendPayload: nothing to send (empty text and no media)");
-    return { channel: MAX_CHANNEL_ID, messageId: lastMessageId };
+    return {
+        channel: MAX_CHANNEL_ID,
+        messageId: lastMessageId,
+        meta: { messageIds: sentMessageIds },
+    };
 }
 let updateHandler = null;
 export function setMaxUpdateHandler(handler) {
@@ -498,19 +581,23 @@ export const maxPlugin = createChatChannelPlugin({
                 "Hard limit 4000 chars per message; the plugin chunks longer text.",
                 "Delivery target: dialog chat id (positive) or `user:<user_id>` for DMs;",
                 "group/channel ids are negative.",
-                "Attach media via the message tool `media` param (local path or URL).",
+                "Attach media via the message tool `media` param (local path or URL); several",
+                "images/videos ride as one album (≤12 per message), audio/files one per message.",
                 "Groups: the bot may answer only when @-mentioned or replied to (requireMention config).",
                 "Inline keyboards on the message tool: prefer the `presentation` param —",
                 'presentation={"blocks": [{"type": "buttons", "buttons": [{"label": "Да", "value": "yes"},',
                 '{"label": "Link", "url": "https://…"}]}]}. Callback buttons carry `value` (or',
                 'action={"type": "callback"|"command", ...}); `url` (or action type "url") makes a link',
-                "button. The keyboard rides on the same message as the tool send.",
+                "button. The keyboard rides on the same message as the tool send. `select` blocks",
+                "render as buttons; tables/charts render as monospace text. Presses of",
+                "presentation callback buttons come back labelled `callback_data: <value>` (plus",
+                "a quote of the message the button was on).",
                 "channelData.maxInlineKeyboard also works — on the message tool AND in a plain",
-                "reply: rows of `{text, url?, payload?}` buttons or plain strings (callback with",
-                "payload = text). Limits: ≤210 buttons, ≤30 rows, ≤7 per row (≤3 if a row has",
-                "a link), link URL ≤2048 chars. The keyboard attaches to the final reply message",
-                "only. A button press returns as an inbound message carrying the payload (plus",
-                "a quote of the message the button was on) — make payloads self-describing.",
+                "reply: rows of `{text, url?, payload?}` buttons (payloads arrive verbatim) or",
+                "plain strings. Wire types: callback, link, clipboard, message, request_contact,",
+                "request_geo_location, open_app. Limits: ≤210 buttons, ≤30 rows, ≤7 per row (≤3",
+                "if a row has link/open_app/request_*), link URL ≤2048 chars. The keyboard",
+                "attaches to the final reply message only.",
                 "",
                 "### MAX message actions",
                 'Sticker: message(action="sticker", target="<chat_id>", stickerId="<code>") — codes come',
@@ -614,24 +701,38 @@ export const maxPlugin = createChatChannelPlugin({
         base: {
             deliveryMode: "direct",
             // Portable presentation (message tool `presentation` param): MAX renders
-            // button blocks natively as inline keyboards; everything else degrades
-            // to text before renderPresentation is called.
+            // button/select blocks natively as inline keyboards; tables and charts
+            // render as monospace text blocks (MAX has no native data blocks).
             presentationCapabilities: {
                 supported: true,
                 buttons: true,
-                selects: false,
-                context: false,
-                divider: false,
-                charts: false,
-                tables: false,
+                selects: true,
+                context: true,
+                divider: true,
+                charts: true,
+                tables: true,
                 limits: {
                     actions: {
                         maxActions: MAX_KEYBOARD_LIMITS.maxButtons,
                         maxActionsPerRow: MAX_PRESENTATION_ROW_SIZE,
                         maxRows: MAX_KEYBOARD_LIMITS.maxRows,
+                        maxLabelLength: 128,
+                        // Leave room for the private envelope prefix inside the 1024-byte
+                        // callback payload limit.
+                        maxValueBytes: 960,
                         supportsStyles: false,
                         supportsDisabled: false,
                         supportsLayoutHints: false,
+                    },
+                    selects: {
+                        maxOptions: 20,
+                        maxLabelLength: 128,
+                        maxValueBytes: 960,
+                    },
+                    text: {
+                        maxLength: 4000,
+                        encoding: "characters",
+                        markdownDialect: "markdown",
                     },
                 },
             },
@@ -725,6 +826,93 @@ export function ensureBotForOutbound(cfg) {
 }
 /** Update types the polling loop asks for (webhook subscription mirrors this). */
 const POLL_ALLOWED_UPDATES = ["message_created", "message_callback", "bot_started", "message_edited"];
+/**
+ * Subscribe the account's webhook URL (POST /subscriptions). Shared by
+ * startup and the watchdog re-subscribe path.
+ */
+export async function subscribeMaxWebhook(account) {
+    const resp = await maxFetch(`${account.apiBaseUrl}/subscriptions`, {
+        method: "POST",
+        headers: { "content-type": "application/json", Authorization: account.token },
+        body: JSON.stringify({
+            url: account.webhookUrl,
+            update_types: POLL_ALLOWED_UPDATES,
+            ...(account.webhookSecret ? { secret: account.webhookSecret } : {}),
+        }),
+    });
+    if (!resp.ok) {
+        throw new Error(`POST /subscriptions failed: HTTP ${resp.status} ${await resp.text()}`);
+    }
+}
+const WEBHOOK_WATCHDOG_INTERVAL_MS = 12 * 60 * 1000;
+/**
+ * Register the bot command menu (PATCH /me/commands, schema BotCommandsPatch:
+ * ≤32 commands, name 1..64 chars, description ≤128). Invalid entries are
+ * dropped with a warning; over-128 descriptions are truncated.
+ */
+export async function registerMaxBotCommands(params) {
+    if (!Array.isArray(params.commands))
+        return 0;
+    const commands = params.commands
+        .flatMap((entry) => {
+        const name = typeof entry?.name === "string" ? entry.name.trim() : "";
+        if (!name || name.length > 64) {
+            params.log?.warn?.("[MAX] commands entry skipped: name must be 1-64 chars");
+            return [];
+        }
+        const description = typeof entry?.description === "string" ? entry.description.trim() : "";
+        return [
+            {
+                name,
+                ...(description ? { description: description.slice(0, 128) } : {}),
+            },
+        ];
+    })
+        .slice(0, 32);
+    if (commands.length < params.commands.length) {
+        params.log?.warn?.(`[MAX] commands truncated to 32 entries (configured ${params.commands.length})`);
+    }
+    const resp = await maxFetch(`${params.apiBaseUrl}/me/commands`, {
+        method: "PATCH",
+        headers: { "content-type": "application/json", Authorization: params.token },
+        body: JSON.stringify({ commands }),
+    });
+    if (!resp.ok) {
+        throw new Error(`PATCH /me/commands failed: HTTP ${resp.status} ${await resp.text()}`);
+    }
+    return commands.length;
+}
+/**
+ * MAX drops a webhook subscription after ~8h of failed deliveries. In webhook
+ * mode, re-check every 12 minutes and re-create ours when it is gone; in
+ * polling mode the watchdog is never started. Returns a stop function.
+ */
+export function startMaxWebhookWatchdog(params) {
+    const { account, log } = params;
+    const timer = setInterval(() => {
+        void (async () => {
+            try {
+                const resp = await maxFetch(`${account.apiBaseUrl}/subscriptions`, {
+                    headers: { Authorization: account.token },
+                });
+                if (!resp.ok)
+                    throw new Error(`GET /subscriptions failed: HTTP ${resp.status}`);
+                const json = (await resp.json().catch(() => ({})));
+                const subscriptions = Array.isArray(json?.subscriptions) ? json.subscriptions : [];
+                if (subscriptions.some((s) => s?.url === account.webhookUrl))
+                    return;
+                log?.warn?.("[MAX] webhook subscription is missing, re-creating");
+                await subscribeMaxWebhook(account);
+                log?.info?.(`[MAX] Webhook re-subscribed: ${account.webhookUrl}`);
+            }
+            catch (err) {
+                log?.warn?.(`[MAX] webhook watchdog check failed: ${err?.message ?? err}`);
+            }
+        })();
+    }, params.intervalMs ?? WEBHOOK_WATCHDOG_INTERVAL_MS);
+    timer.unref?.();
+    return () => clearInterval(timer);
+}
 /** Transient polling errors, mirroring the SDK's Polling.shouldRetry. */
 function isTransientPollingError(err) {
     if (!err || typeof err !== "object")
@@ -829,23 +1017,29 @@ async function runMaxAccount(ctx) {
     const handler = updateHandler;
     const bot = initializeBot(account.token, account.apiBaseUrl, account.httpProxy);
     statusSink({ running: true, lastStartAt: Date.now(), lastError: null });
+    // Bot command menu (channels.max.commands) — best-effort, never fatal.
+    if (Array.isArray(account.commands)) {
+        try {
+            const count = await registerMaxBotCommands({
+                commands: account.commands,
+                apiBaseUrl: account.apiBaseUrl,
+                token: account.token,
+                log,
+            });
+            log?.info(`[MAX] bot commands registered (${count})`);
+        }
+        catch (err) {
+            log?.warn(`[MAX] bot command registration failed: ${err?.message ?? err}`);
+        }
+    }
     let webhookActive = false;
+    let stopWebhookWatchdog = null;
     if (account.webhookUrl) {
         try {
             await bot.api.getMyInfo();
-            const resp = await maxFetch(`${account.apiBaseUrl}/subscriptions`, {
-                method: "POST",
-                headers: { "content-type": "application/json", Authorization: account.token },
-                body: JSON.stringify({
-                    url: account.webhookUrl,
-                    update_types: ["message_created", "message_callback", "bot_started", "message_edited"],
-                    ...(account.webhookSecret ? { secret: account.webhookSecret } : {}),
-                }),
-            });
-            if (!resp.ok) {
-                throw new Error(`POST /subscriptions failed: HTTP ${resp.status} ${await resp.text()}`);
-            }
+            await subscribeMaxWebhook(account);
             webhookActive = true;
+            stopWebhookWatchdog = startMaxWebhookWatchdog({ account, log });
             log?.info(`[MAX] Webhook subscribed: ${account.webhookUrl}`);
         }
         catch (err) {
@@ -917,6 +1111,7 @@ async function runMaxAccount(ctx) {
         throw err;
     }
     finally {
+        stopWebhookWatchdog?.();
         ctx.abortSignal?.removeEventListener("abort", stopBot);
         stopBot();
         statusSink({ running: false, lastStopAt: Date.now() });

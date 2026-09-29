@@ -294,6 +294,20 @@ export const maxMessageActions: ChannelMessageActionAdapter = {
       const to = stripTargetPrefix(
         readStringParam(params, "to") ?? readStringParam(params, "target", { required: true }),
       )!;
+      // MAX supports pins only in groups/channels; dialogs answer 400
+      // "not available for dialogs", so short-circuit without an API call
+      // (positive chat ids are dialogs by the MAX id convention).
+      const normalized = normalizeMaxTarget(to);
+      const numericTarget = Number(normalized);
+      const isDialogTarget =
+        /^user:/i.test(normalized) || (Number.isFinite(numericTarget) && numericTarget > 0);
+      if (isDialogTarget) {
+        return jsonResult(
+          action === "pin"
+            ? { to, pinned: false, reason: "pins are not supported in direct chats" }
+            : { to, unpinned: false, reason: "pins are not supported in direct chats" },
+        );
+      }
       const chatId = resolveChatId(to, action);
       assertChatIdAdmitted(cfg, chatId, action);
       if (action === "pin") {

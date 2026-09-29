@@ -32,7 +32,7 @@ describe("canonicalizeMaxPresentationPayload", () => {
     expect(result.channelData).toEqual({
       maxInlineKeyboard: [
         [
-          { type: "callback", text: "Да", payload: "yes" },
+          { type: "callback", text: "Да", payload: "mxcb1:yes" },
           { type: "link", text: "Сайт", url: "https://max.ru" },
         ],
       ],
@@ -50,9 +50,9 @@ describe("canonicalizeMaxPresentationPayload", () => {
       },
     } as any);
 
-    expect(result.text).toBe("Заказ\n\nВзять заказ #12?");
+    expect(result.text).toBe("**Заказ**\n\nВзять заказ #12?");
     expect(result.channelData?.maxInlineKeyboard).toEqual([
-      [{ type: "callback", text: "Взять", payload: "take" }],
+      [{ type: "callback", text: "Взять", payload: "mxcb1:take" }],
     ]);
   });
 
@@ -78,7 +78,7 @@ describe("canonicalizeMaxPresentationPayload", () => {
 
     expect(result.channelData).toEqual({
       maxNotify: false,
-      maxInlineKeyboard: [[{ type: "callback", text: "OK", payload: "ok" }]],
+      maxInlineKeyboard: [[{ type: "callback", text: "OK", payload: "mxcb1:ok" }]],
     });
   });
 
@@ -96,5 +96,103 @@ describe("canonicalizeMaxPresentationPayload", () => {
   it("returns the payload unchanged without a presentation", () => {
     const payload = { text: "plain" } as any;
     expect(canonicalizeMaxPresentationPayload(payload)).toBe(payload);
+  });
+
+  it("prefixes a toned title with the tone emoji", () => {
+    const result = canonicalizeMaxPresentationPayload({
+      presentation: {
+        title: "Отчёт готов",
+        tone: "success",
+        blocks: [{ type: "text", text: "Собрано 12 строк." }],
+      },
+    } as any);
+    expect(result.text).toBe("✅ **Отчёт готов**\n\nСобрано 12 строк.");
+  });
+
+  it("renders tables as aligned monospace blocks", () => {
+    const result = canonicalizeMaxPresentationPayload({
+      presentation: {
+        blocks: [
+          {
+            type: "table",
+            caption: "Продажи",
+            headers: ["Месяц", "Сумма"],
+            rows: [
+              ["Янв", 10],
+              ["Февраль", 200],
+            ],
+          },
+        ],
+      },
+    } as any);
+    expect(result.text).toBe(
+      "**Продажи**\n```\nМесяц   | Сумма\n--------+------\nЯнв     | 10\nФевраль | 200\n```",
+    );
+  });
+
+  it("renders select options as callback buttons with enveloped payloads", () => {
+    const result = canonicalizeMaxPresentationPayload({
+      presentation: {
+        blocks: [
+          {
+            type: "select",
+            placeholder: "Выбери язык",
+            options: [
+              { label: "Русский", value: "ru" },
+              { label: "English", value: "en" },
+              { label: "Deutsch", value: "de" },
+            ],
+          },
+        ],
+      },
+    } as any);
+    expect(result.text).toBe("_Выбери язык_");
+    expect(result.channelData?.maxInlineKeyboard).toEqual([
+      [
+        { type: "callback", text: "Русский", payload: "mxcb1:ru" },
+        { type: "callback", text: "English", payload: "mxcb1:en" },
+      ],
+      [{ type: "callback", text: "Deutsch", payload: "mxcb1:de" }],
+    ]);
+  });
+
+  it("encodes approval and question actions into private envelopes", () => {
+    const result = canonicalizeMaxPresentationPayload({
+      presentation: {
+        blocks: [
+          {
+            type: "buttons",
+            buttons: [
+              {
+                label: "Разрешить",
+                action: { type: "approval", approvalId: "ap1", approvalKind: "exec", decision: "allow-once" },
+              },
+              {
+                label: "Запретить",
+                action: { type: "approval", approvalId: "ap1", approvalKind: "exec", decision: "deny" },
+              },
+            ],
+          },
+        ],
+      },
+    } as any);
+    expect(result.channelData?.maxInlineKeyboard).toEqual([
+      [
+        { type: "callback", text: "Разрешить", payload: "mxa1:e:o:ap1" },
+        { type: "callback", text: "Запретить", payload: "mxa1:e:d:ap1" },
+      ],
+    ]);
+  });
+
+  it("replaces core fallback text instead of duplicating it", () => {
+    const result = canonicalizeMaxPresentationPayload({
+      text: "Заголовок\n\nТекст блока",
+      presentationTextMode: "fallback",
+      presentation: {
+        title: "Заголовок",
+        blocks: [{ type: "text", text: "Текст блока" }],
+      },
+    } as any);
+    expect(result.text).toBe("**Заголовок**\n\nТекст блока");
   });
 });

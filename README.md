@@ -20,17 +20,23 @@ Tested with OpenClaw **2026.9.3**, MAX Bot API v2 (`platform-api2.max.ru`).
 - ✅ DM security (`dmPolicy`: open/allowlist/closed) + pairing flow for new contacts
 - ✅ Direct messages and group chats (group sessions isolated per chat)
 - ✅ **Media support** — images, video and files are downloaded into the OpenClaw media store and analyzed by the configured multimodal models
-- ✅ **Voice transcription** — audio messages transcribed by the gateway's media-understanding pipeline (`tools.media.audio`, e.g. Groq Whisper) — no keys or uploads handled by the plugin itself
+- ✅ **Voice transcription** — audio messages transcribed by the gateway's media-understanding pipeline (`tools.media.audio`, e.g. Groq Whisper); a server-side `transcription` sent by MAX wins and skips the gateway STT call
 - ✅ `bot_started` support — the "Начать" button becomes `/start` (deep-link payload appended)
-- ✅ Typing indicator with keepalive, bot-loop protection, message deduplication
+- ✅ Typing indicator with keepalive, `mark_seen` read receipts, bot-loop protection, message deduplication
 - ✅ **Streaming replies** — partial model output edits a single draft message in place (`editMessage`), final text replaces it; can be disabled
 - ✅ **Scoped HTTP proxy** — optional per-account proxy for MAX API traffic only, without touching the rest of the gateway
 - ✅ **Agent prompt hints** — the plugin teaches the agent MAX Markdown rules, the 4000-char limit and delivery-target syntax via `agentPrompt`
 - ✅ **Inline keyboards** — the agent attaches buttons via the `message` tool `presentation` param or `channelData.maxInlineKeyboard`; button presses arrive as inbound messages and are auto-acknowledged
 - ✅ **Message actions** — the agent edits/deletes its own messages, pins/unpins in chats, echoes stickers and sends native location pins / contact cards via the `message` tool
 - ✅ **`max_send_file` agent tool** — delivers a local file or an http(s) URL into the current MAX chat (media-roots confinement, SSRF-guarded download)
-- ✅ **Group policies** — `groupPolicy` (open/allowlist/disabled), per-group config with a `*` wildcard, `requireMention` (a reply to the bot counts as a mention)
-- ✅ **Reliable inbound** — persistent polling marker + dedup snapshot (at-least-once across restarts), `message_edited` tracking, send retry on `attachment.not.ready`
+- ✅ **Group policies** — `groupPolicy` (open/allowlist/disabled), per-group config with a `*` wildcard, `requireMention` (a reply to the bot or a structured `user_mention` markup counts as a mention)
+- ✅ **Reliable inbound** — persistent polling marker + dedup snapshot (at-least-once across restarts), `message_edited` tracking, send retry on `attachment.not.ready`, one retry on transient download failures
+- ✅ **Outbound rate limiting** — per-chat sliding window (2 messages/sec, MAX platform limit) with FIFO queueing across all send paths; edits/typing/callback answers are not throttled
+- ✅ **Webhook watchdog** — in webhook mode the subscription is re-verified every 12 minutes and re-created if MAX dropped it
+- ✅ **Media albums** — several images/videos go out as one album message (up to 12, the MAX limit); audio/files always send individually; the `message` tool reports all message ids
+- ✅ **Full presentation rendering** — `select` blocks become inline buttons, tables and charts render as aligned monospace blocks, `title`/`tone` produce a bold emoji-prefixed heading
+- ✅ **Operator buttons** — presentation `approval` / ask-user `question` actions resolve through OpenClaw's canonical approval/question runtimes; the keyboard message is replaced with a status line so a resolved control cannot be pressed twice (allowFrom-gated)
+- ✅ **All MAX button wire types** — `callback`, `link`, `clipboard`, `message`, `request_contact`, `request_geo_location`, `open_app`
 - ✅ **Security hardening** — SSRF-guarded downloads, media-roots confinement for local sends, access check before any attachment download, attachment limits (≤10 files, ≤25 MB each)
 - ✅ **Send options** — per-message silent (`channelData.maxNotify`) and link-preview suppression (`maxDisableLinkPreview`), with channel-level defaults; remote images attach by URL without a re-upload
 - ✅ **Pairing approval notice** — the user gets a ✅ confirmation in MAX after `openclaw pairing approve --notify`
@@ -96,6 +102,8 @@ npm run build
 | `notify` | Channel default for outbound notifications; `false` = send silently. Per-message override: `channelData.maxNotify` |
 | `disableLinkPreview` | Channel default for suppressing link previews. Per-message override: `channelData.maxDisableLinkPreview` |
 | `logInboundPreview` | `false` (default) — the inbound log line carries metadata only (chat, type, sender, text length); `true` adds a 50-char text preview for debugging |
+| `markSeen` | `true` (default) — send a `mark_seen` read receipt once per inbound message; `false` disables read receipts |
+| `commands` | Optional bot command menu: array of `{ "name": "start", "description": "…" }` (≤32 entries, name 1–64 chars, description ≤128), registered via `PATCH /me/commands` at channel start |
 | `webhookUrl` | Public URL of the `/max/webhook` route. When set, the plugin subscribes via `POST /subscriptions` automatically. When empty — long polling |
 | `webhookSecret` | Optional secret; verified against the `X-Max-Bot-Api-Secret` header |
 | `apiBaseUrl` | API override, default `https://platform-api2.max.ru` |
@@ -106,7 +114,9 @@ npm run build
 
 Since plugin **0.3.0**, transcription runs through the gateway's media-understanding
 pipeline — the plugin itself holds no API keys and uploads nothing to third parties.
-Enable and configure `tools.media.audio` in `~/.openclaw/openclaw.json`, and supply
+When MAX attaches a server-side `transcription` to an audio message (schema field,
+not currently sent in production), it is used directly and the gateway STT call is
+skipped. Enable and configure `tools.media.audio` in `~/.openclaw/openclaw.json`, and supply
 the provider key to the **gateway** (e.g. `env.GROQ_API_KEY`, or the official Groq
 provider plugin):
 
@@ -239,6 +249,10 @@ have configured.
 
 Set `webhookUrl` to the public address of your gateway's `/max/webhook` route — the plugin registers the subscription with MAX itself (`update_types: message_created, message_callback, bot_started, message_edited`). Set `webhookSecret` so MAX signs deliveries.
 
+A watchdog re-checks the subscription every 12 minutes: MAX drops webhooks
+after ~8h of failed deliveries, and a missing subscription is re-created with
+the same parameters (logged as `webhook subscription is missing, re-creating`).
+
 ### Long polling
 
 Leave `webhookUrl` empty — the plugin polls `GET /updates` automatically. The polling
@@ -312,11 +326,17 @@ array = one row), giving explicit control over row layout:
 ```
 
 - Simplified `{text, url?, payload?}` (and plain strings — payload = label) or full wire
-  buttons `{type: "callback"|"link"|"clipboard", …}`; URL buttons win over payload.
+  buttons `{type: "callback"|"link"|"clipboard"|"message"|"request_contact"|"request_geo_location"|"open_app", …}`;
+  URL buttons win over payload.
+- Wire types follow the MAX API schema: `message` sends the button text as a user
+  message; `request_contact`/`request_geo_location` ask for the user's contact /
+  location (`quick: true` sends location without confirmation); `open_app` opens a
+  mini app (`web_app`: public bot name, optional slug `payload`, ≤ 512 chars).
 - On any single payload `channelData.maxInlineKeyboard` wins over `presentation`
   and legacy `interactive` buttons.
 - MAX limits enforced by validation: ≤ **210** buttons, ≤ **30** rows, ≤ **7** buttons
-  per row (≤ **3** when the row contains a `link`-type button), link URL ≤ **2048** chars.
+  per row (≤ **3** when the row contains a `link`/`open_app`/`request_*` button),
+  link URL ≤ **2048** chars, label ≤ **128** chars, callback payload ≤ **1024** bytes.
 - The keyboard rides only the **final** message (a streaming draft is edited into the
   final text with the keyboard attached; long replies carry it on the last chunk).
 - Invalid keyboards are logged and dropped — the text reply still goes out.
@@ -324,6 +344,22 @@ array = one row), giving explicit control over row layout:
   payload as text; the callback is auto-acknowledged (`POST /answers`), so no spinner
   is left hanging on the button. Make payloads self-describing — MAX does not echo the
   button label.
+
+**Presentation buttons vs. verbatim keyboards.** Buttons produced from the portable
+`presentation` param carry private envelopes, so typed actions survive the round trip:
+`callback` values arrive as `callback_data: <value>` (never parsed as a slash command),
+`command` actions re-enter as the command itself, and `approval` / ask-user `question`
+actions are resolved by OpenClaw's canonical approval/question runtimes — the keyboard
+message is then replaced with a status line (buttons removed, so a resolved control
+cannot be pressed twice). Approval buttons require the pressing user to be listed
+explicitly in `channels.max.allowFrom` (a `*` wildcard is enough for questions, never
+for approvals). Buttons from `channelData.maxInlineKeyboard` keep arriving verbatim.
+
+**Selects, tables and charts.** `select` blocks render as callback buttons (two per
+row, `placeholder` shown as an italic prompt). Tables and charts render as aligned
+monospace blocks (MAX has no native data blocks). A `presentation.title` renders bold
+on the first line, prefixed with a tone emoji (`info` ℹ️, `success` ✅, `warning` ⚠️,
+`danger` ⛔).
 
 ### Message actions (message tool)
 
@@ -352,6 +388,10 @@ message(action="sendAttachment", type="contact",  target="<chat_id>", contactId=
   `replyTo` (a message id) is supported on sticker/location/contact sends.
 - **Contacts** use the snake_case wire payload (`vcf_info` VCard signed with an
   HMAC of the bot token, or `max_info` for a MAX user id).
+- **Pin/unpin are group-only:** MAX rejects pins in direct chats (400 "not
+  available for dialogs"), so a dialog target (positive chat id or `user:<id>`)
+  short-circuits without an API call and returns
+  `{ pinned: false, reason: "pins are not supported in direct chats" }`.
 - **Chat scoping (since 0.5.3):** these moderation actions may target dialogs
   (DMs) freely, but a **group/channel chat only when it is admitted by the
   group policy** (`groupPolicy` / `groups`, same rules as the inbound gate) —
@@ -389,7 +429,9 @@ preserving pre-0.5 behavior):
 - `open` — every group the bot joins is served (a startup warning is logged).
 
 `requireMention` (per-group → `"*"` → top-level, default `false`): the bot answers
-only when @-mentioned by username or when its own message is replied to; button
+only when @-mentioned by username (plain text or a structured `user_mention`
+markup element referencing the bot's user id / `@username`) or when its own
+message is replied to; button
 presses on the bot's keyboard always count. A single group can be switched off with
 `enabled: false`. Downloads are gated the same way — a dropped message never
 triggers an attachment fetch.
@@ -449,7 +491,10 @@ Since **0.3.5** the plugin implements the `sendMedia` outbound adapter: the agen
 `POST /uploads` endpoint because max-bot-api 0.2.5 drops the upload token on the
 Buffer code path. Since **0.5.0** http(s) **image** URLs are attached by link
 (`payload.url`, no re-upload) after a private/loopback host check; every other
-remote file is still downloaded through the SSRF guard and uploaded.
+remote file is still downloaded through the SSRF guard and uploaded. Since **0.6.0**
+several attached images/videos are grouped into **albums** of up to 12 per message
+(the MAX limit); audio and files always go one per message, and the tool result
+carries every sent message id.
 
 Per-message send options (reply path, alongside the keyboard pattern):
 `channelData.maxNotify: false` sends silently, `channelData.maxDisableLinkPreview: true`
@@ -477,6 +522,13 @@ npm run dev    # watch mode
 npm run build  # build to dist/
 npm test       # vitest + SDK import guard (check:sdk)
 ```
+
+The MAX API surface is pinned by a schema-conformance test against a snapshot of
+the official schema (`src/__fixtures__/max-schema-*.yaml`). Refresh it with
+`npm run schema:update` (clones max-messenger/api-schema); a failing conformance
+test afterwards means MAX renamed or removed something the plugin relies on.
+Chat-administration and comment-thread update types (`bot_added`, `dialog_*`,
+`comment_*`, …) are deliberately ignored and noted once per type at debug level.
 
 ## Troubleshooting
 

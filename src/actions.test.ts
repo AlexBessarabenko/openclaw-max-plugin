@@ -178,10 +178,10 @@ describe("handleAction: pin/unpin", () => {
 
     await maxMessageActions.handleAction!({
       action: "pin",
-      params: { target: "max:5050", messageId: "m-6" },
+      params: { target: "max:-900200", messageId: "m-6" },
       ...CTX,
     } as any);
-    expect(fakeBot.api.pinMessage).toHaveBeenLastCalledWith(5050, "m-6", undefined);
+    expect(fakeBot.api.pinMessage).toHaveBeenLastCalledWith(-900200, "m-6", undefined);
   });
 
   it("unpins the currently pinned message in a chat", async () => {
@@ -196,22 +196,38 @@ describe("handleAction: pin/unpin", () => {
     expect(res.details).toEqual({ ok: true, to: "-900100" });
   });
 
-  it("rejects user: targets and missing params with a clear error", async () => {
-    await expect(
-      maxMessageActions.handleAction!({
-        action: "pin",
-        params: { target: "user:777000", messageId: "m-7" },
-        ...CTX,
-      } as any),
-    ).rejects.toThrow(/not chats/);
-    await expect(
-      maxMessageActions.handleAction!({
-        action: "unpin",
-        params: { target: "5050" },
-        ...CTX,
-      } as any),
-    ).resolves.toBeDefined();
-    expect(fakeBot.api.unpinMessage).toHaveBeenCalledWith(5050);
+  it("dialogs short-circuit without an API call (MAX pins are group-only)", async () => {
+    const pinned = await maxMessageActions.handleAction!({
+      action: "pin",
+      params: { target: "5050", messageId: "m-7" },
+      ...CTX,
+    } as any);
+    expect(pinned.details).toEqual({
+      to: "5050",
+      pinned: false,
+      reason: "pins are not supported in direct chats",
+    });
+
+    const pinnedUser = await maxMessageActions.handleAction!({
+      action: "pin",
+      params: { target: "user:777000", messageId: "m-7" },
+      ...CTX,
+    } as any);
+    expect(pinnedUser.details).toMatchObject({ pinned: false });
+
+    const unpinned = await maxMessageActions.handleAction!({
+      action: "unpin",
+      params: { target: "max:5050" },
+      ...CTX,
+    } as any);
+    expect(unpinned.details).toEqual({
+      to: "5050",
+      unpinned: false,
+      reason: "pins are not supported in direct chats",
+    });
+
+    expect(fakeBot.api.pinMessage).not.toHaveBeenCalled();
+    expect(fakeBot.api.unpinMessage).not.toHaveBeenCalled();
   });
 
   it("wraps API errors with a permissions hint", async () => {
@@ -219,7 +235,7 @@ describe("handleAction: pin/unpin", () => {
     await expect(
       maxMessageActions.handleAction!({
         action: "pin",
-        params: { target: "5050", messageId: "m-8" },
+        params: { target: "-900100", messageId: "m-8" },
         ...CTX,
       } as any),
     ).rejects.toThrow(/permission to pin/);

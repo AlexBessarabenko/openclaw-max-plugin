@@ -17,6 +17,8 @@ export type ResolvedAccount = {
     webhookSecret: string | undefined;
     apiBaseUrl: string;
     httpProxy: string | undefined;
+    /** channels.max.commands — bot command menu (PATCH /me/commands at startup). */
+    commands?: unknown;
 };
 export declare function resolveAccount(cfg: OpenClawConfig, accountId?: string | null): ResolvedAccount;
 /** Strip routing prefixes ("max:", "max:group:") from a delivery target. */
@@ -89,6 +91,27 @@ export declare function sendMaxMedia(bot: Bot, params: {
     mediaLocalRoots?: readonly string[];
     extra?: Record<string, unknown>;
 }): Promise<string>;
+/** MAX renders albums of up to 12 photo/video attachments in one message. */
+export declare const MAX_ALBUM_SIZE = 12;
+/**
+ * Group outbound media into as few messages as MAX allows: images and videos
+ * form albums of up to 12, audio/files always go one per message. Grouping is
+ * decided by the upload type resolved from the filename/extension.
+ */
+export declare function groupMaxMediaUrls(mediaUrls: string[]): string[][];
+/**
+ * Send several media as few messages as MAX allows (albums of up to 12
+ * images/videos; audio/files one per message). The caption rides on the first
+ * message only. Returns the message id of each sent message.
+ */
+export declare function sendMaxMediaGroup(bot: Bot, params: {
+    to: string;
+    text?: string;
+    mediaUrls: string[];
+    mediaReadFile?: (filePath: string) => Promise<Buffer>;
+    mediaLocalRoots?: readonly string[];
+    extra?: Record<string, unknown>;
+}): Promise<string[]>;
 /**
  * Startup warning for the permissive group posture: with groupPolicy=open and
  * no groupAllowFrom the bot answers everyone in every group it is added to.
@@ -116,11 +139,12 @@ export declare function resolveMaxSendOptions(cfg: OpenClawConfig, channelData?:
 };
 /**
  * Convert a portable `presentation` payload into the one MAX payload shape
- * used by every outbound funnel (mirrors the core Telegram adapter): buttons
- * blocks become `channelData.maxInlineKeyboard`, everything else degrades to
- * fallback text. Called by the core via `outbound.renderPresentation` after
- * the presentation was adapted to `presentationCapabilities` — so by this
- * point unsupported blocks (selects, tables, …) are already text.
+ * used by every outbound funnel: the full block set renders to MAX markdown
+ * (title/tone line, context, dividers, monospace tables/charts), buttons and
+ * select options become `channelData.maxInlineKeyboard` rows carrying private
+ * callback envelopes (see src/presentation.ts). Called by the core via
+ * `outbound.renderPresentation` after the presentation was adapted to
+ * `presentationCapabilities`.
  */
 export declare function canonicalizeMaxPresentationPayload(payload: ReplyPayload): ReplyPayload;
 type InboundUpdateHandler = (update: any, token: string) => Promise<void>;
@@ -155,6 +179,38 @@ export declare function getBot(): Bot | null;
  * from the configured token; `Bot` only starts polling on `.startPolling()`.
  */
 export declare function ensureBotForOutbound(cfg: OpenClawConfig): Bot;
+/**
+ * Subscribe the account's webhook URL (POST /subscriptions). Shared by
+ * startup and the watchdog re-subscribe path.
+ */
+export declare function subscribeMaxWebhook(account: ResolvedAccount): Promise<void>;
+/**
+ * Register the bot command menu (PATCH /me/commands, schema BotCommandsPatch:
+ * ≤32 commands, name 1..64 chars, description ≤128). Invalid entries are
+ * dropped with a warning; over-128 descriptions are truncated.
+ */
+export declare function registerMaxBotCommands(params: {
+    commands: unknown;
+    apiBaseUrl: string;
+    token: string;
+    log?: {
+        info?: (msg: string) => void;
+        warn?: (msg: string) => void;
+    };
+}): Promise<number>;
+/**
+ * MAX drops a webhook subscription after ~8h of failed deliveries. In webhook
+ * mode, re-check every 12 minutes and re-create ours when it is gone; in
+ * polling mode the watchdog is never started. Returns a stop function.
+ */
+export declare function startMaxWebhookWatchdog(params: {
+    account: ResolvedAccount;
+    log?: {
+        info?: (msg: string) => void;
+        warn?: (msg: string) => void;
+    };
+    intervalMs?: number;
+}): () => void;
 /**
  * Long-polling loop with a persistent marker (at-least-once delivery).
  *
