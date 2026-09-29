@@ -18,6 +18,7 @@ import { isDuplicate } from "./src/dedup.js";
 import { acquireChatSendSlot } from "./src/send-limiter.js";
 import { decodeMaxPresentationCallback } from "./src/presentation.js";
 import { resolveMaxRuntimeControlCallback } from "./src/runtime-controls.js";
+import { alignMarkdownTables } from "./src/markdown-tables.js";
 import { rememberStickerCode } from "./src/stickers.js";
 import { groupChatAdmission } from "./src/chat-policy.js";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk/channel-core";
@@ -620,14 +621,17 @@ async function runInbound(api: OpenClawPluginApi, facts: InboundFacts, token: st
           bot: NonNullable<ReturnType<typeof getBot>>,
           text: string,
           extra?: Record<string, unknown>,
-        ): Promise<any> =>
-          replyUserId != null
+        ): Promise<any> => {
+          // MAX markdown has no table syntax — align pipe tables to monospace.
+          if (extra?.format === "markdown") text = alignMarkdownTables(text);
+          return replyUserId != null
             ? acquireChatSendSlot(`user:${replyUserId}`).then(() =>
                 bot.api.sendMessageToUser(replyUserId, text, extra as any),
               )
             : acquireChatSendSlot(`chat:${chatId}`).then(() =>
                 bot.api.sendMessageToChat(Number(chatId), text, extra as any),
               );
+        };
 
         // --- Draft streaming: cumulative partial replies edit one draft message ---
         const streamingEnabled = (cfg.channels as any)?.[MAX_CHANNEL_ID]?.streaming !== false;
@@ -663,7 +667,7 @@ async function runInbound(api: OpenClawPluginApi, facts: InboundFacts, token: st
             if (!bot || !draft.mid) return;
             try {
               await bot.api.editMessage(draft.mid, {
-                text,
+                text: alignMarkdownTables(text),
                 format: "markdown",
                 ...(attachments ? { attachments } : {}),
               });

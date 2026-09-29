@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.1] - 2026-09-29
+
+### Added
+
+- **Markdown tables in plain replies render aligned.** GitHub-style pipe tables
+  in outbound text are rewritten as monospace ``` blocks with columns aligned
+  by display width (MAX markdown has no table syntax, so raw pipes rendered
+  misaligned). Applies to replies, streaming drafts and the `message` tool;
+  content already inside code fences is untouched.
+
 ## [0.6.0] - 2026-09-29
 
 ### Added
@@ -190,6 +200,7 @@ Tested with OpenClaw **2026.9.3**.
 - **Agent prompt hints** — MAX Markdown rules, 4000-char limit and target syntax are
   taught to the agent via `agentPrompt`.
 
+[0.6.1]: https://github.com/AlexBessarabenko/openclaw-max-plugin/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/AlexBessarabenko/openclaw-max-plugin/compare/v0.5.3...v0.6.0
 [0.5.3]: https://github.com/AlexBessarabenko/openclaw-max-plugin/compare/v0.5.2...v0.5.3
 [0.5.2]: https://github.com/AlexBessarabenko/openclaw-max-plugin/compare/v0.5.1...v0.5.2

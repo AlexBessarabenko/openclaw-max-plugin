@@ -10,6 +10,7 @@ import { isDuplicate } from "./src/dedup.js";
 import { acquireChatSendSlot } from "./src/send-limiter.js";
 import { decodeMaxPresentationCallback } from "./src/presentation.js";
 import { resolveMaxRuntimeControlCallback } from "./src/runtime-controls.js";
+import { alignMarkdownTables } from "./src/markdown-tables.js";
 import { rememberStickerCode } from "./src/stickers.js";
 import { groupChatAdmission } from "./src/chat-policy.js";
 import { resolveDmGroupAccessWithLists } from "openclaw/plugin-sdk/channel-policy";
@@ -515,9 +516,14 @@ async function runInbound(api, facts, token) {
                 const replyUserId = facts.replyTarget != null
                     ? Number(facts.replyTarget.replace(/^max:user:/i, ""))
                     : null;
-                const sendReplyMessage = (bot, text, extra) => replyUserId != null
-                    ? acquireChatSendSlot(`user:${replyUserId}`).then(() => bot.api.sendMessageToUser(replyUserId, text, extra))
-                    : acquireChatSendSlot(`chat:${chatId}`).then(() => bot.api.sendMessageToChat(Number(chatId), text, extra));
+                const sendReplyMessage = (bot, text, extra) => {
+                    // MAX markdown has no table syntax — align pipe tables to monospace.
+                    if (extra?.format === "markdown")
+                        text = alignMarkdownTables(text);
+                    return replyUserId != null
+                        ? acquireChatSendSlot(`user:${replyUserId}`).then(() => bot.api.sendMessageToUser(replyUserId, text, extra))
+                        : acquireChatSendSlot(`chat:${chatId}`).then(() => bot.api.sendMessageToChat(Number(chatId), text, extra));
+                };
                 // --- Draft streaming: cumulative partial replies edit one draft message ---
                 const streamingEnabled = cfg.channels?.[MAX_CHANNEL_ID]?.streaming !== false;
                 const ttsAuto = String(cfg?.tts?.auto ?? cfg?.messages?.tts?.auto ?? "").toLowerCase();
@@ -547,7 +553,7 @@ async function runInbound(api, facts, token) {
                             return;
                         try {
                             await bot.api.editMessage(draft.mid, {
-                                text,
+                                text: alignMarkdownTables(text),
                                 format: "markdown",
                                 ...(attachments ? { attachments } : {}),
                             });

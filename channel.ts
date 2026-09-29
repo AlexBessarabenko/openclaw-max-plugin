@@ -12,6 +12,7 @@ import { downloadRemoteMedia, readLocalMedia } from "./src/media-access.js";
 import { isPrivateOrLoopbackHost } from "openclaw/plugin-sdk/ssrf-runtime";
 import { primeSeenMessageIds, recentSeenMessageIds } from "./src/dedup.js";
 import { acquireChatSendSlot } from "./src/send-limiter.js";
+import { alignMarkdownTables } from "./src/markdown-tables.js";
 import { loadMaxPollingState, saveMaxPollingState } from "./src/polling-state.js";
 import { maxMessageActions } from "./src/actions.js";
 import {
@@ -136,6 +137,8 @@ export async function sendMaxMessage(
   extra?: Record<string, unknown>,
 ): Promise<any> {
   const target = resolveSendTarget(to);
+  // MAX markdown has no table syntax — align pipe tables into monospace blocks.
+  if ((extra as any)?.format === "markdown") text = alignMarkdownTables(text);
   const hasAttachments =
     Array.isArray((extra as any)?.attachments) && (extra as any).attachments.length > 0;
   const maxAttempts = hasAttachments ? 1 + ATTACHMENT_RETRY_DELAYS_MS.length : 1;
@@ -177,8 +180,10 @@ export async function sendMaxBody(
   },
 ): Promise<string> {
   const target = resolveSendTarget(to);
+  const bodyText =
+    body.format === "markdown" && body.text ? alignMarkdownTables(body.text) : body.text;
   const payload: Record<string, unknown> = {
-    ...(body.text ? { text: body.text } : {}),
+    ...(bodyText ? { text: bodyText } : {}),
     ...(body.attachments ? { attachments: body.attachments } : {}),
     ...(body.link ? { link: body.link } : {}),
     ...(body.format ? { format: body.format } : {}),

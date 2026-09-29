@@ -13,7 +13,7 @@ Tested with OpenClaw **2026.9.3**, MAX Bot API v2 (`platform-api2.max.ru`).
 
 ## Features
 
-- ✅ Two-way messaging (text, Markdown, 4000-char chunking)
+- ✅ Two-way messaging (text, Markdown, 4000-char chunking; pipe tables in replies are auto-aligned into monospace blocks — MAX has no markdown table syntax)
 - ✅ **MAX Bot API v2** — `platform-api2.max.ru` by default, bundled Минцифры CA certificates
 - ✅ Webhook (auto-subscription, `X-Max-Bot-Api-Secret` validation, immediate 200 ACK) + Long Polling fallback
 - ✅ **Correct per-chat sessions** — canonical OpenClaw session keys, session recording and last-route updates (context no longer resets between messages)
